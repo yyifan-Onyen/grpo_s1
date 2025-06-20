@@ -1,4 +1,4 @@
-# GRPO: SAIYAN
+# GRPO
 
 
 ## STEP1
