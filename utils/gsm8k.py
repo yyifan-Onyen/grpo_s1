@@ -27,11 +27,10 @@ def verify_answer(result, answer):
     return {'correct': correct}
 
 
-def gsm8k_reward_function(response, target, end_token):
-    if end_token in response:
-        response = response.split(end_token)[0]
+def gsm8k_reward_function(response, target):
     correct = verify_answer(response, target)
     return 1 if correct['correct'] else 0
+
 
 
 def main():
@@ -41,7 +40,7 @@ def main():
     response = "The final answer is $\\boxed{10}$"
     target = "10"
     end_token = "$\\\\boxed{}$"
-    print(gsm8k_reward_function(response, target, end_token))
+    print(gsm8k_reward_function(response, target))
 
 if __name__ == "__main__":
     main()

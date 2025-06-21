@@ -13,11 +13,11 @@ training:
   epochs: 2
   random_seed: 1337
   max_prompt_len: 256
-  max_gen_len: 512  # Reduced from 1024 to 512 to save memory
+  max_gen_len: 128  # Reduced from 1024 to 512 to save memory
   temperature: 1.0  # Temperature for sampling during generation
   batch_size: 64
   num_questions_per_batch: 32
-  num_answers_per_question: 2  # Reduced from 5 to 2 for multi-GPU (total 6 episodes per step)
+  num_answers_per_question: 5  # Reduced from 5 to 2 for multi-GPU (total 6 episodes per step)
   # Number of examples per gradient accumulation step
   micro_batch_size: 1  # Reduced from 2 to 1 to save memory
   max_grad_norm: 1.0

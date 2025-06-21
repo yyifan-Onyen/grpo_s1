@@ -101,6 +101,28 @@ class LanguageModel(object):
             return completions, indices, masks
         else:
             return completions
+        
+
+    def compute_log_probs(self, indices: torch.Tensor) -> torch.Tensor:
+        """Compute log probabilities for the given token indices."""
+        input_ids = indices.to(self.device)
+        attention_mask = input_ids != self.tokenizer.pad_token_id
+        position_ids = attention_mask.long().cumsum(dim=-1) - 1
+        position_ids[attention_mask == 0] = 0
+
+        input_logits = self.model.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False
+        )["logits"][:, :-1]
+
+        log_probs = torch.gather(
+            torch.log_softmax(input_logits, dim=-1),
+            dim=-1,
+            index=input_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
+        return log_probs
 
 
     def save(self, path: str) -> None:
@@ -110,8 +132,8 @@ class LanguageModel(object):
 
 if __name__ == "__main__":
     # path = "Qwen/Qwen2.5-3B-Instruct"
-    # path = "ministral/Ministral-3b-instruct"
-    path = "meta-llama/Llama-3.2-3B-Instruct"
+    path = "ministral/Ministral-3b-instruct"
+    # path = "meta-llama/Llama-3.2-3B-Instruct"
     model = LanguageModel(path)
 
     prompts = [
@@ -125,6 +147,7 @@ if __name__ == "__main__":
         temperature=1.0,
         verbose=True
     )
+    
     log_probs = model.compute_log_probs(indices)
 
     print("The shape of indices:", indices.shape)

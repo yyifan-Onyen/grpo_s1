@@ -10,7 +10,6 @@ import torch
 import yaml
 from torch.utils.tensorboard.writer import SummaryWriter
 from typing import List
-
 from grpo import rollout, update_policy
 from utils.model import LanguageModel
 
@@ -102,7 +101,7 @@ def main(config_path: str):
 
 
                 for i, result in enumerate(rollout_result["completions"]):
-                    reward_result = reward_function(result, question["solution"], tokenizer.eos_token)
+                    reward_result = reward_function(result, question["solution"])
                     full_indices = rollout_result["indices"][i]
                     mask = rollout_result["masks"][i]
                     prefix_token_ids = full_indices[~mask].cpu().tolist()
@@ -204,7 +203,7 @@ def main(config_path: str):
             
             if step % config["training"]["ckpt_save_interval"] == 0:
                 for model_idx, (model, name) in enumerate(zip(models, model_names)):
-                    ckpt_path = config["training"]["ckpt_dir"] / f"{name}_step_{step}"
+                    ckpt_path = Path(config["training"]["ckpt_dir"]) / f"{name}_step_{step}"
                     model.save(str(ckpt_path))
                     print(f"Saved checkpoint for {name} at step {step}")
                     torch.cuda.empty_cache()

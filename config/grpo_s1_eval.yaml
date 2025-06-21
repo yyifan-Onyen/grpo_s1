@@ -1,0 +1,8 @@
+checkpoint_dir: "Qwen/Qwen2.5-3B-Instruct"
+task: "gsm8k"
+eval_samples: 100 # -1 for all
+output_file: "evaluation_results.json"
+device: "cuda:0"
+dtype: "bfloat16"
+max_gen_len: 512
+temperature: 1.0
