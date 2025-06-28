@@ -12,7 +12,7 @@ from tqdm import tqdm
 def evaluate_model(model, tokenizer, dataset, reward_function, config, task_name="gsm8k"):
     model.model.eval()
     total_rewards = []
-    total_samples = min(len(dataset), config.get("eval_samples", 100))
+    total_samples = len(dataset) if config.get("eval_samples", -1) == -1 else min(len(dataset), config.get("eval_samples", -1))
     detailed_results = []
     
     with torch.no_grad():
@@ -69,10 +69,6 @@ def main():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     
-    
-
-    
-    
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
@@ -109,7 +105,9 @@ def main():
         task_name=task_name
     )
 
-    print(eval_results)
+    import json
+    with open(config['output_file'], 'w') as f:
+        json.dump(eval_results, f, indent=4)
     
     
     

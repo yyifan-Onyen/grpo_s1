@@ -1,5 +1,5 @@
+num_models: 3
 model:
-  # Currently we have three models here
   pretrained_model_path:
     - Qwen/Qwen2.5-3B-Instruct
     - ministral/Ministral-3b-instruct

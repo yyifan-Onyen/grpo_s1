@@ -1,0 +1,8 @@
+checkpoint_dir: "google/gemma-2b-it"
+task: "gsm8k"
+eval_samples: -1 # -1 for all
+output_file: "evaluation_results_gemma2b_gsm8k.json"
+device: "cuda:0"
+dtype: "bfloat16"
+max_gen_len: 512
+temperature: 1.0

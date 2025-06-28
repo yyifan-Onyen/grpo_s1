@@ -1,7 +1,7 @@
-checkpoint_dir: "Qwen/Qwen2.5-3B-Instruct"
+checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/mas_rl/outputs/grpo_qwen_gsm8k"
 task: "gsm8k"
-eval_samples: 100 # -1 for all
-output_file: "evaluation_results.json"
+eval_samples: -1 # -1 for all
+output_file: "evaluation_results_grpo_trl.json"
 device: "cuda:0"
 dtype: "bfloat16"
 max_gen_len: 512

@@ -8,6 +8,17 @@ QWEN-2.5-3B-Insturct
 LLAMA-3.2-3B-Insturct
 MINISTRAL-3B-Insturct
 
+| Model      | Task   | Performance (Success Rate) | Method    |
+|------------|--------|----------------------------|-----------|
+| QWEN       | gsm8k  | 79.38%                     | zero-shot |
+| QWEN       | gsm8k  | 81.96%                     | trl       |
+| MINISTRAL  | gsm8k  | 1.14%                      | zero-shot |
+| gemma      | gsm8k  | 8.64%                      | zero-shot |
+| QWEN       | gsm8k  | 75.43%                     | costum_trl|
 
-JUN20 
-- [] has the problem that all model has high loss and grad norm. need solve
+
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python train_new.py --config config/single_qwen_grpo.yaml 
+```
+
