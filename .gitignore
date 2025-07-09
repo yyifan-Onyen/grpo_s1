@@ -177,6 +177,7 @@ cython_debug/
 # Logs and checkpoints
 logs/
 ckpt/
+checkpoints/
 
 # Model directories
 Llama-3.2-3B-Instruct/

@@ -12,11 +12,43 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from typing import List
 from grpo import rollout, update_policy
 from utils.model import LanguageModel
+import copy
+
+
+def prepare_adapter_configs(config):
+    """准备适配器配置"""
+    fact_config = None
+    lora_config = None
+    
+    if config["model"].get("use_fact", False):
+        fact_config = {
+            "fact_rank": config["model"].get("fact_rank", 16),
+            "fact_alpha": config["model"].get("fact_alpha", 32),
+            "fact_dropout": config["model"].get("fact_dropout", 0.05),
+            "fact_scale": config["model"].get("fact_scale", 1.0),
+            "fact_target_modules": config["model"].get("fact_target_modules", 
+                                                       ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+        }
+    
+    elif config["model"].get("use_lora", False):
+        lora_config = {
+            "lora_rank": config["model"].get("lora_rank", 16),
+            "lora_alpha": config["model"].get("lora_alpha", 32),
+            "lora_dropout": config["model"].get("lora_dropout", 0.05),
+            "target_modules": config["model"].get("lora_target_modules", 
+                                                 ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+        }
+    
+    return fact_config, lora_config
 
 
 def main(config_path: str):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+    
+    # 准备适配器配置
+    fact_config, lora_config = prepare_adapter_configs(config)
+    
     pretrained_model_paths = [Path(path) for path in config["model"]["pretrained_model_path"]]
     
 
@@ -46,18 +78,41 @@ def main(config_path: str):
     
 
     models = []
+    ref_models = []  # Reference models for KL divergence
     model_names = [Path(path).name for path in pretrained_model_paths]
     target_devices = [f"cuda:{i}" for i in range(num_models)]
     
     for i, (model_path, name, device) in enumerate(zip(pretrained_model_paths, model_names, target_devices)):
         print(f"Loading {name} on {device}...")
+        
+        # Load main model
         model = LanguageModel(
             model_path=str(model_path),
             target_device=device,
             torch_dtype=dtype,
+            fact_config=fact_config,
+            lora_config=lora_config,
         )
         model.model.train()
         models.append(model)
+        
+        # Load reference model (copy of initial model for KL divergence)
+        if config["training"].get("use_ref_model", True):
+            print(f"  Loading reference model for {name}...")
+            ref_model = LanguageModel(
+                model_path=str(model_path),
+                target_device=device,
+                torch_dtype=dtype,
+                fact_config=None,  # 参考模型不使用适配器
+                lora_config=None,  # 参考模型不使用适配器
+            )
+            ref_model.model.eval()  # Keep reference model in eval mode
+            # Freeze reference model parameters
+            for param in ref_model.model.parameters():
+                param.requires_grad = False
+            ref_models.append(ref_model)
+        else:
+            ref_models.append(None)
         
         torch.cuda.empty_cache()
         gc.collect()
@@ -90,6 +145,16 @@ def main(config_path: str):
     step = 0
     max_steps = len(train_dataset) * config["training"]["epochs"]
     
+    # GRPO training parameters
+    num_completions_per_prompt = config["training"]["num_answers_per_question"]
+    epsilon_low = config["training"].get("epsilon_low", 0.2)
+    epsilon_high = config["training"].get("epsilon_high", 0.2)
+    beta = config["training"].get("beta", 0.01)  # KL regularization
+    loss_type = config["training"].get("loss_type", "grpo")
+    
+    # Storage for old log probabilities (for PPO clipping)
+    old_log_probs_storage = [None] * num_models
+    
     for epoch in range(config["training"]["epochs"]):
         print(f"Epoch {epoch+1} of {config['training']['epochs']}")
         for question_idx, question in enumerate(train_dataset):
@@ -107,7 +172,7 @@ def main(config_path: str):
                     model=model,
                     question=question["prompt"],
                     max_gen_len=config["training"]["max_gen_len"],
-                    num_answer_per_question=config["training"]["num_answers_per_question"],
+                    num_answer_per_question=num_completions_per_prompt,
                     temperature=config["training"].get("temperature", 1.0),
                 )
                 print(f"    {name}: Generated {len(rollout_result['completions'])} episodes")
@@ -205,6 +270,16 @@ def main(config_path: str):
                     print(f"    Warning: {name} has no valid episodes for policy update, skipping...")
                     continue
                 
+                # Ensure episodes are properly grouped for advantage calculation
+                if len(final_episodes) % num_completions_per_prompt != 0:
+                    print(f"    Warning: {name} has {len(final_episodes)} episodes, not divisible by {num_completions_per_prompt}")
+                    # Truncate to make it divisible
+                    final_episodes = final_episodes[:len(final_episodes) - (len(final_episodes) % num_completions_per_prompt)]
+                
+                if len(final_episodes) == 0:
+                    print(f"    Warning: {name} has no valid episodes after grouping, skipping...")
+                    continue
+                
                 print(f"    {name}: Using {len(final_episodes)} episodes for policy update")
                 
 
@@ -216,8 +291,24 @@ def main(config_path: str):
                     max_grad_norm=config["training"]["max_grad_norm"],
                     device=torch.device(device),
                     dtype=dtype,
+                    num_completions_per_prompt=num_completions_per_prompt,
+                    ref_model=ref_models[model_idx].model if ref_models[model_idx] is not None else None,
+                    old_log_probs=old_log_probs_storage[model_idx],
+                    epsilon_low=epsilon_low,
+                    epsilon_high=epsilon_high,
+                    beta=beta,
+                    loss_type=loss_type,
                 )
-                print(f"    {name}: Updated policy - Loss: {update_result['loss']:.4f}, Grad norm: {update_result['grad_norm']:.4f}, Entropy: {update_result['entropy']:.4f}")
+                
+                # Store current log probs for next iteration (PPO clipping)
+                if update_result["current_log_probs"] is not None:
+                    old_log_probs_storage[model_idx] = update_result["current_log_probs"]
+                
+                print(f"    {name}: Updated policy - Loss: {update_result['loss']:.4f}, "
+                      f"Grad norm: {update_result['grad_norm']:.4f}, "
+                      f"Entropy: {update_result['entropy']:.4f}, "
+                      f"KL div: {update_result['kl_div']:.4f}, "
+                      f"Clip ratio: {update_result['clip_ratio']:.4f}")
                 
                 del final_episodes
                 del update_result

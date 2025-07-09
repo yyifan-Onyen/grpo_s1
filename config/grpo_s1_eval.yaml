@@ -1,7 +1,7 @@
-checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/mas_rl/outputs/grpo_qwen_gsm8k"
+checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/grpo-s1/checkpoints/single_qwen_grpo_improved/Qwen2.5-3B-Instruct_step_6000"
 task: "gsm8k"
 eval_samples: -1 # -1 for all
-output_file: "evaluation_results_grpo_trl.json"
+output_file: "evaluation_results_grpo_trl_improved_6000.json"
 device: "cuda:0"
 dtype: "bfloat16"
 max_gen_len: 512

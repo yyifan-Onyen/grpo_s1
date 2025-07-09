@@ -1,0 +1,32 @@
+model:
+  pretrained_model_path:
+    - "Qwen/Qwen2.5-3B-Instruct"
+  dtype: "bfloat16"
+  
+  # LoRA 配置
+  use_lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+data:
+  name: "gsm8k"
+
+training:
+  random_seed: 42
+  epochs: 1
+  learning_rate: 0.00001
+  max_gen_len: 256
+  num_answers_per_question: 4
+  temperature: 1.0
+  max_grad_norm: 1.0
+  ckpt_save_interval: 2000
+  ckpt_dir: "checkpoints/grpo_lora_qwen3b"
+  
+  # GRPO-specific parameters
+  use_ref_model: true
+  epsilon_low: 0.2
+  epsilon_high: 0.2
+  beta: 0.01
+  loss_type: "grpo" 

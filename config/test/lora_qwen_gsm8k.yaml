@@ -1,0 +1,16 @@
+# LoRA Qwen Step 2000 GSM8K Evaluation Config
+checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/grpo-s1/checkpoints/grpo_lora_qwen3b/Qwen2.5-3B-Instruct_step_4000"
+is_lora: true  # Enable LoRA loading
+
+# Task settings
+task: "gsm8k"
+eval_samples: -1  # Start with small batch for testing
+
+# Model settings  
+device: "cuda:0"
+dtype: "bfloat16"
+max_gen_len: 512
+temperature: 1.0
+
+# Output
+output_file: "lora_qwen_step4000_gsm8k_results.json" 
