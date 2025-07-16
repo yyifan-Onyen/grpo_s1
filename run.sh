@@ -27,16 +27,14 @@ python evaluate.py --config config/test/gsm8k_eval.yaml
 
 
 
-
-
-
-
-
-
 #ablation study
 python evaluate.py --config config/test/llama_trl_gsm8k.yaml
 
 python evaluate.py --config config/test/min_trl_gsm8k.yaml
+
+#尝试phil实验
+python evaluate.py --config config/test/gsm8l_phil.yaml
+
 
 
 

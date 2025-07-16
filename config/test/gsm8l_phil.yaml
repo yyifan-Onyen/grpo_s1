@@ -1,0 +1,16 @@
+# LoRA Qwen Step 2000 GSM8K Evaluation Config
+checkpoint_dir: "microsoft/Phi-3-mini-128k-instruct"
+
+
+# Task settings
+task: "gsm8k"
+eval_samples: -1  # Start with small batch for testing
+
+# Model settings  
+device: "cuda:1"
+dtype: "bfloat16"
+max_gen_len: 512
+temperature: 1.0
+
+# Output
+output_file: "phil_gsm8k_results.json" 
