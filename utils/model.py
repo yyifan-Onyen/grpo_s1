@@ -318,14 +318,16 @@ class LanguageModel(object):
         # Always save the tokenizer
         self.tokenizer.save_pretrained(path)
         
-        # Save adapter configuration metadata
-        adapter_config = {
-            "original_model_path": self.original_model_path,
-            "fact_config": self.fact_config,
-            "lora_config": self.lora_config,
-        }
-        with open(os.path.join(path, "adapter_config.json"), "w") as f:
-            json.dump(adapter_config, f, indent=2)
+        # Only save adapter configuration if adapters are actually used
+        if self.fact_config is not None or self.lora_config is not None:
+            adapter_config = {
+                "original_model_path": self.original_model_path,
+                "fact_config": self.fact_config,
+                "lora_config": self.lora_config,
+            }
+            with open(os.path.join(path, "adapter_config.json"), "w") as f:
+                json.dump(adapter_config, f, indent=2)
+            print(f"Adapter configuration saved to {path}/adapter_config.json")
         
         # FacT Mode - Save only adapter weights
         if self.fact_config is not None:

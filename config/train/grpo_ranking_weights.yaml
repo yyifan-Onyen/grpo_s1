@@ -1,0 +1,44 @@
+# 多模型动态权重训练配置 - 完整模型版本
+# 支持排名法：表现好的模型权重小（减少更新），表现差的模型权重大（增加更新）
+# 使用完整模型，不使用LoRA或FACT适配器
+
+# 模型配置
+model:
+  pretrained_model_path: 
+    - "Qwen/Qwen2.5-3B-Instruct"
+    - "meta-llama/Llama-3.2-3B-Instruct" 
+    - "ministral/Ministral-3b-instruct"
+  dtype: "bfloat16"
+  # 使用完整模型，不使用LoRA或FACT适配器
+  use_lora: false
+  use_fact: false
+
+# 数据配置
+data:
+  name: "gsm8k"
+
+# 训练配置
+training:
+  random_seed: 42
+  epochs: 1
+  learning_rate: 0.00001  # 基础学习率，使用完整模型时建议更小的学习率
+  max_gen_len: 256
+  num_answers_per_question: 4
+  max_grad_norm: 1.0
+  temperature: 1.0
+  
+  # GRPO参数
+  epsilon_low: 0.2
+  epsilon_high: 0.2
+  beta: 0.01
+  loss_type: "grpo"
+  use_ref_model: true
+  
+  # 检查点配置
+  ckpt_dir: "checkpoints/grpo_ranking"
+  ckpt_save_interval: 3000
+  
+  # 排名法动态权重配置
+  ranking_weights:
+    min_weight: 0.3    # 表现最好模型的权重 (减少更新)
+    max_weight: 2.0    # 表现最差模型的权重 (增加更新) 

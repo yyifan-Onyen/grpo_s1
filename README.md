@@ -19,6 +19,7 @@ MINISTRAL-3B-Insturct
 
 
 
+
 # This is how to run the train
 ```bash
 CUDA_VISIBLE_DEVICES=5 python train_new.py --config config/single_qwen_grpo.yaml 
@@ -27,4 +28,12 @@ CUDA_VISIBLE_DEVICES=5 python train_new.py --config config/single_qwen_grpo.yaml
 # This is How to run the test
 ```bash
 CUDA_VISIBLE_DEVICES=7 python evaluate.py --config config/single_qwen_grpo.yaml 
+```
+
+
+
+```bash
+python train_weight.py --config config/train/grpo_ranking_weights.yaml > logs/grpo_ranking_weights.txt
+
+python train_threshold.py --config config/train/grpo_threshold.yaml > logs/grpo_threshold.txt
 ```

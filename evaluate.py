@@ -164,7 +164,7 @@ def main():
                        help="Path to config file")
     
     args = parser.parse_args()
-
+    
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     
@@ -246,13 +246,13 @@ def main():
             target_device=config['device'],
             torch_dtype=dtype,
         )
-
-    # Evaluate
-    eval_results = evaluate_model(
-        model=model,
-        tokenizer=model.tokenizer,
-        dataset=test_dataset,
-        reward_function=reward_function,
+        
+        # Evaluate
+        eval_results = evaluate_model(
+            model=model,
+            tokenizer=model.tokenizer,
+            dataset=test_dataset,
+            reward_function=reward_function,
         config=config,
         task_name=task_name
     )
@@ -260,7 +260,7 @@ def main():
     with open(config['output_file'], 'w') as f:
         json.dump(eval_results, f, indent=4)
     
-    
-    
+
+
 if __name__ == "__main__":
     main()

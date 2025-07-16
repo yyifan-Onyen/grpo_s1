@@ -1,6 +1,6 @@
 model:
   pretrained_model_path:
-    - "Qwen/Qwen2.5-3B-Instruct"
+    - "ministral/Ministral-3b-instruct"
   dtype: "bfloat16"
 
 data:
@@ -14,8 +14,8 @@ training:
   num_answers_per_question: 4 
   temperature: 1.0
   max_grad_norm: 1.0
-  ckpt_save_interval: 2000
-  ckpt_dir: "checkpoints/single_qwen_grpo_improved"
+  ckpt_save_interval: 3000
+  ckpt_dir: "checkpoints/single_mis_grpo_custom"
   
   # GRPO-specific parameters
   use_ref_model: true          # Whether to use reference model for KL divergence
