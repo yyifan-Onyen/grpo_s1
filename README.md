@@ -14,6 +14,8 @@ MINISTRAL-3B-Insturct
 | QWEN       | gsm8k  | 82.03%                     | FACT 6000 |
 | QWEN       | gsm8k  | 79.83%                     | LoRA 4000 |
 | QWEN       | gsm8k  | 82.18%                     | FACT 2000 |
+| LLAMA      | gsm8k  | 78.39%                     | old_threshold 3000 |
+
 
 
 

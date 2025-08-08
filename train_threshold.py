@@ -96,6 +96,7 @@ def main(config_path: str):
             torch_dtype=dtype,
             fact_config=fact_config,
             lora_config=lora_config,
+            gradient_checkpointing=config["model"].get("gradient_checkpointing", False),
         )
         model.model.train()
         models.append(model)
@@ -109,6 +110,7 @@ def main(config_path: str):
                 torch_dtype=dtype,
                 fact_config=None,  # 参考模型不使用适配器
                 lora_config=None,  # 参考模型不使用适配器
+                gradient_checkpointing=False,  # 参考模型不需要梯度检查点
             )
             ref_model.model.eval()  # Keep reference model in eval mode
             # Freeze reference model parameters
@@ -164,6 +166,9 @@ def main(config_path: str):
         for question_idx, question in enumerate(train_dataset):
             step += 1
             print(f"Step {step}/{max_steps} - Question {question_idx+1}/{len(train_dataset)}")
+            print(f"Question: {question['prompt']}")
+            print(f"Target: {question['solution']}")
+            print()
             
 
             all_episodes = [] if is_multi_model_mode else None  
@@ -184,12 +189,36 @@ def main(config_path: str):
                 model_episodes = []
                 model_rewards = []
 
+                # === 详细的Sample Logging ===
+                print(f"    === {name} Rollout Samples ===")
                 for i, result in enumerate(rollout_result["completions"]):
                     reward_result = reward_function(result, question["solution"])
                     full_indices = rollout_result["indices"][i]
                     mask = rollout_result["masks"][i]
                     prefix_token_ids = full_indices[~mask].cpu().tolist()
                     generated_token_ids = full_indices[mask].cpu().tolist()
+                    
+                    # 检测乱码字符
+                    has_non_ascii = any(ord(c) > 127 for c in result)
+                    non_ascii_chars = [c for c in result if ord(c) > 127]
+                    
+                    # 详细日志输出
+                    print(f"      Sample {i+1}/{len(rollout_result['completions'])}:")
+                    print(f"        Reward: {reward_result}")
+                    print(f"        Length: {len(result)} chars, {len(generated_token_ids)} tokens")
+                    print(f"        Has non-ASCII: {has_non_ascii}")
+                    if has_non_ascii:
+                        print(f"        Non-ASCII chars: {non_ascii_chars[:10]}...")  # 只显示前10个
+                    
+                    # 显示文本内容（完整显示）
+                    display_text = result.replace('\n', '\\n').replace('\t', '\\t')
+                    print(f"        Text: \"{display_text}\"")
+                    
+                    # 如果reward为0，显示更多调试信息
+                    if reward_result == 0:
+                        print(f"        [FAILED] Target: {question['solution']}")
+                    
+                    print()  # 空行分隔
                     
                     episode_data = {
                         "prefix_token_ids": prefix_token_ids,
@@ -198,6 +227,9 @@ def main(config_path: str):
                         "completion": result,
                         "model_name": name,
                         "model_idx": model_idx,
+                        "has_non_ascii": has_non_ascii,  # 添加乱码标记
+                        "text_length": len(result),      # 添加文本长度
+                        "token_count": len(generated_token_ids),  # 添加token数量
                     }
                     
                     model_episodes.append(episode_data)
@@ -208,7 +240,21 @@ def main(config_path: str):
                         all_episodes.append(episode_data)
 
                 model_episode_groups.append(model_episodes)
-                print(f"    {name}: Mean reward: {np.mean(model_rewards):.3f}")
+                
+                # 增强的统计信息
+                successful_samples = sum(1 for r in model_rewards if r > 0)
+                failed_samples = len(model_rewards) - successful_samples
+                non_ascii_samples = sum(1 for ep in model_episodes if ep.get("has_non_ascii", False))
+                avg_text_length = np.mean([ep["text_length"] for ep in model_episodes])
+                avg_token_count = np.mean([ep["token_count"] for ep in model_episodes])
+                
+                print(f"    {name}: Rollout Summary:")
+                print(f"      Mean reward: {np.mean(model_rewards):.3f}")
+                print(f"      Success/Failed: {successful_samples}/{failed_samples}")
+                print(f"      Non-ASCII samples: {non_ascii_samples}/{len(model_episodes)}")
+                print(f"      Avg text length: {avg_text_length:.1f} chars")
+                print(f"      Avg token count: {avg_token_count:.1f} tokens")
+                print()
                 
                 del rollout_result
                 del model_rewards
@@ -234,9 +280,12 @@ def main(config_path: str):
                     total_other_episodes = 0
                     high_quality_episodes = 0
                     
+                    print(f"    === {name} Threshold Filtering ===")
+                    
                     for ep in all_episodes:
                         if ep["model_idx"] == model_idx:
                             # 自己的答案直接使用
+                            print(f"      [OWN] Using own sample: reward={ep['reward']}, from {ep['model_name']}")
                             final_episodes.append({
                                 "prefix_token_ids": ep["prefix_token_ids"], 
                                 "generated_token_ids": ep["generated_token_ids"],
@@ -244,9 +293,15 @@ def main(config_path: str):
                             })
                         else:
                             total_other_episodes += 1
-                            # 只有reward达到阈值的其他模型答案才被采用
-                            if ep["reward"] >= reward_threshold:
+                            source_model = ep["model_name"]
+                            reward = ep["reward"]
+                            has_non_ascii = ep.get("has_non_ascii", False)
+                            
+                            # 显示过滤决策
+                            if reward >= reward_threshold:
                                 high_quality_episodes += 1
+                                print(f"      [ACCEPT] From {source_model}: reward={reward} (>= {reward_threshold}), non-ASCII: {has_non_ascii}")
+                                
                                 try:
                                     completion_tokenized = tokenizer(
                                         ep["completion"], 
@@ -261,14 +316,22 @@ def main(config_path: str):
                                             "generated_token_ids": new_completion_ids,
                                             "reward": ep["reward"],
                                         })
+                                        print(f"        → Successfully retokenized: {len(new_completion_ids)} tokens")
                                     else:
-                                        print(f"    Skipping episode: completion tokens out of range")
+                                        print(f"        → SKIP: tokens out of range (max_id: {max(new_completion_ids)}, vocab: {vocab_size})")
                                         
                                 except Exception as e:
-                                    print(f"    Warning: Failed to retokenize completion: {e}")
+                                    print(f"        → SKIP: retokenization failed: {e}")
                                     continue
+                            else:
+                                print(f"      [REJECT] From {source_model}: reward={reward} (< {reward_threshold}), non-ASCII: {has_non_ascii}")
+                                # 显示被拒绝样本的完整文本
+                                rejected_text = ep["completion"].replace('\n', '\\n')
+                                print(f"        Text: \"{rejected_text}\"")
                     
                     print(f"    {name}: Threshold filtering - {high_quality_episodes}/{total_other_episodes} other episodes passed (threshold={reward_threshold})")
+                    print(f"    {name}: Final episodes for training: {len(final_episodes)}")
+                    print()
                     
                 else:
 
@@ -336,6 +399,12 @@ def main(config_path: str):
             del model_episode_groups
             torch.cuda.empty_cache()
             gc.collect()
+            
+            # === Step Summary ===
+            print(f"=== Step {step} Completed ===")
+            print(f"All models have finished processing question {question_idx+1}")
+            print("=" * 50)
+            print()
             
 
             if step % 5 == 0:

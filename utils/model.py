@@ -179,7 +179,8 @@ class LanguageModel(object):
         torch_dtype: str = "auto",
         attn_impl: str = "sdpa",
         lora_config: Optional[Dict] = None,
-        fact_config: Optional[Dict] = None
+        fact_config: Optional[Dict] = None,
+        gradient_checkpointing: bool = False
     ):
         # Store configuration for save() method
         self.original_model_path = model_path
@@ -206,6 +207,11 @@ class LanguageModel(object):
             self.model = self.model.to("cpu")
         
         print(f"Model {model_path} loaded on device: {target_device}")
+        
+        # Configure gradient checkpointing if enabled
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            print(f"Gradient checkpointing enabled for {model_path}")
         
         # Apply FacT if configured
         if fact_config is not None:
@@ -257,6 +263,9 @@ class LanguageModel(object):
         self.eos_token = self.tokenizer.eos_token
         self.eos_token_id = self.tokenizer.eos_token_id  
         self.pad_token_id = self.tokenizer.pad_token_id
+        
+        # Store gradient checkpointing state for dynamic control
+        self.gradient_checkpointing_enabled = gradient_checkpointing
 
     def generate(
         self,

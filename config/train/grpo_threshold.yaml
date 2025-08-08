@@ -6,10 +6,13 @@ model:
   pretrained_model_path:
     - "Qwen/Qwen2.5-3B-Instruct"
     - "meta-llama/Llama-3.2-3B-Instruct" 
-    - "ministral/Ministral-3b-instruct"
+    - "microsoft/Phi-3-mini-128k-instruct"
   
   # 模型精度配置
   dtype: "bfloat16"  # 支持: bfloat16, float16, float32
+  
+  # 梯度检查点配置 - 节省显存但会增加计算时间
+  gradient_checkpointing: true  # 开启梯度检查点以节省显存
   
   # FACT适配器配置（可选）
   use_fact: false
@@ -35,8 +38,8 @@ training:
   epochs: 1
   learning_rate: 0.00001
   random_seed: 42
-  max_gen_len: 256
-  temperature: 1.0
+  max_gen_len: 512
+  temperature: 0.7
   
   # GRPO特定参数
   num_answers_per_question: 4  # 每个问题生成的答案数量

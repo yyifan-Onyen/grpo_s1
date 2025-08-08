@@ -1,9 +1,0 @@
-checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/grpo-s1/ckpt/Qwen2.5-3B-Instruct_step_7000"
-task: "gsm8k"
-eval_samples: -1 # -1 for all
-output_file: "evaluation_results_costum_grpo_qwen.json"
-device: "cuda:0"
-dtype: "bfloat16"
-max_gen_len: 512
-temperature: 1.0
-num_answer_per_question: 2

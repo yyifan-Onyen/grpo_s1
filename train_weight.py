@@ -75,6 +75,14 @@ def prepare_adapter_configs(config):
     return fact_config, lora_config
 
 
+def compute_individual_weights(model_rewards, k=7.0, threshold=0.5):
+    weights = []
+    for reward in model_rewards:
+        weight = 1 / (1 + np.exp(k * (reward - threshold)))
+        weights.append(weight)
+    return weights
+
+
 def main(config_path: str):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
@@ -98,7 +106,14 @@ def main(config_path: str):
     ranking_config = config["training"].get("ranking_weights", {})
     min_weight = ranking_config.get("min_weight", 0.3)
     max_weight = ranking_config.get("max_weight", 2.0)
+    
+    # 个体权重配置
+    individual_config = config["training"].get("individual_weights", {})
+    individual_k = individual_config.get("k", 5.0)
+    individual_threshold = individual_config.get("threshold", 0.5)
+    
     print(f"Ranking weights: min={min_weight}, max={max_weight}")
+    print(f"Individual weights: k={individual_k}, threshold={individual_threshold}")
     
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -259,10 +274,10 @@ def main(config_path: str):
             # === Compute Ranking Weights ===
             ranking_weights = [1.0] * num_models  # 默认权重
             if is_multi_model_mode and len(model_mean_rewards) == num_models:
-                ranking_weights = compute_ranking_weights(
+                ranking_weights = compute_individual_weights(
                     model_mean_rewards, 
-                    min_weight=min_weight, 
-                    max_weight=max_weight
+                    k=individual_k, 
+                    threshold=individual_threshold
                 )
                 
                 # 显示排名和权重信息

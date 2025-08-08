@@ -1,5 +1,5 @@
 # LoRA Qwen Step 2000 GSM8K Evaluation Config
-checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/grpo-s1/checkpoints/grpo_threshold/Qwen2.5-3B-Instruct_step_3000"
+checkpoint_dir: "/home/local/PARTNERS/yz646/grpo_revision/grpo-s1/checkpoints/grpo_threshold/Llama-3.2-3B-Instruct_step_3000"
 
 
 # Task settings
@@ -13,4 +13,4 @@ max_gen_len: 512
 temperature: 1.0
 
 # Output
-output_file: "grpo_threshold_qwen_step3000_gsm8k_results.json" 
+output_file: "grpo_threshold_llama_step3000_gsm8k_results.json" 

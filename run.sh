@@ -16,8 +16,25 @@ python train_weight.py --config config/train/grpo_ranking_weights.yaml > logs/gr
 #尝试threshold实验
 python train_threshold.py --config config/train/grpo_threshold.yaml > logs/grpo_threshold.txt
 
-#尝试grpo_threshold实验
+
+python train_weight.py --config config/train/grpo_weights.yaml > logs/grpo_weights.txt
+
+#尝试grpo_threshold实验 测试
 python evaluate.py --config config/test/gsm8k_eval.yaml
+
+python evaluate.py --config config/test/gsm8k_threshold_llama.yaml
+
+python evaluate.py --config config/test/gsm8k_threshold_qwen.yaml
+
+python evaluate.py --config config/test/gsm8k_threshold_phi.yaml
+
+#weight 的实验 测试
+
+python evaluate.py --config config/test/gsm8k_weight_llama.yaml
+
+python evaluate.py --config config/test/gsm8k_weight_qwen.yaml
+
+python evaluate.py --config config/test/gsm8k_weight_phi.yaml
 
 
 
@@ -31,7 +48,6 @@ python evaluate.py --config config/test/gsm8k_eval.yaml
 python evaluate.py --config config/test/llama_trl_gsm8k.yaml
 
 python evaluate.py --config config/test/min_trl_gsm8k.yaml
-
 #尝试phil实验
 python evaluate.py --config config/test/gsm8l_phil.yaml
 
