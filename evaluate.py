@@ -16,10 +16,10 @@ import json
 import os
 
 
-def evaluate_model(model, tokenizer, dataset, reward_function, config, task_name="gsm8k"):
+def evaluate_model(model, tokenizer, dataset, reward_function, args, task_name="gsm8k"):
     model.model.eval()
     total_rewards = []
-    total_samples = len(dataset) if config.get("eval_samples", -1) == -1 else min(len(dataset), config.get("eval_samples", -1))
+    total_samples = len(dataset)
     detailed_results = []
     
     with torch.no_grad():
@@ -35,8 +35,8 @@ def evaluate_model(model, tokenizer, dataset, reward_function, config, task_name
                 raise ValueError(f"Unsupported task: {task_name}")
             response = model.generate(
                 prompts=[prompt],
-                limitation=config.get("max_gen_len"),
-                temperature=config.get("temperature")
+                limitation=args.max_gen_len,
+                temperature=args.temperature
             )
             response = response[0]
             if task_name == "gsm8k":
@@ -48,9 +48,9 @@ def evaluate_model(model, tokenizer, dataset, reward_function, config, task_name
             total_rewards.append(reward)
             detailed_results.append({
                 "index": i,
-                "prompt": prompt[:100] + "..." if len(prompt) > 100 else prompt,
-                "response": response[:200] + "..." if len(response) > 200 else response,
-                "target": target_solution[:100] + "..." if len(target_solution) > 100 else target_solution,
+                "prompt": prompt,
+                "response": response,
+                "target": target_solution,
                 "reward": reward
             })
     
@@ -159,14 +159,33 @@ class FACTModelWrapper:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate on Tasks")
-    parser.add_argument("--config", type=str, default="config/grpo_s1_eval.yaml", 
-                       help="Path to config file")
+    parser = argparse.ArgumentParser(description="Evaluate model on tasks")
+    
+    # Model configuration
+    parser.add_argument("--model", type=str, required=True, 
+                       help="Model path or checkpoint directory")
+    parser.add_argument("--model-type", type=str, default="full", choices=["full", "lora", "fact"],
+                       help="Type of model checkpoint")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                       help="Device to run evaluation on")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"],
+                       help="Model dtype")
+    
+    # Task configuration
+    parser.add_argument("--task", type=str, default="gsm8k", choices=["gsm8k", "mbpp"],
+                       help="Task to evaluate on")
+    
+    # Generation parameters
+    parser.add_argument("--max-gen-len", type=int, default=512,
+                       help="Maximum generation length")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                       help="Generation temperature")
+    
+    # Output
+    parser.add_argument("--output", type=str, required=True,
+                       help="Output JSON file path")
     
     args = parser.parse_args()
-    
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
     
     # Parse dtype
     dtype_map = {
@@ -174,29 +193,32 @@ def main():
         "float16": torch.float16,
         "float32": torch.float32,
     }
-    dtype = dtype_map.get(config["dtype"], torch.bfloat16)
+    dtype = dtype_map.get(args.dtype, torch.bfloat16)
     
     # Load dataset
-    task_name = config["task"]
-    if task_name == "gsm8k":
+    if args.task == "gsm8k":
         test_dataset = create_gsm8k_dataset()['test']
         reward_function = gsm8k_reward_function
-    elif task_name == "mbpp":
+    elif args.task == "mbpp":
         dataset_dict = create_mbpp_dataset()
         test_dataset = dataset_dict['test']
         reward_function = None 
     else:
-        print(f"Unsupported task: {task_name}")
+        print(f"Unsupported task: {args.task}")
         return
     
-    print(f"\nEvaluating model on {task_name.upper()}...")
+    print(f"\nEvaluating model on {args.task.upper()}...")
+    print(f"Model: {args.model}")
+    print(f"Model type: {args.model_type}")
+    print(f"Device: {args.device}")
+    print(f"Total samples: {len(test_dataset)}")
     
     # Load model - FACT, LoRA or full checkpoint
-    if config.get("is_fact", False):
-        print(f"Loading FACT checkpoint: {config['checkpoint_dir']}")
+    if args.model_type == "fact":
+        print(f"Loading FACT checkpoint: {args.model}")
         
         # Load adapter config
-        adapter_config_path = os.path.join(config['checkpoint_dir'], "adapter_config.json")
+        adapter_config_path = os.path.join(args.model, "adapter_config.json")
         with open(adapter_config_path, 'r') as f:
             adapter_config = json.load(f)
         
@@ -208,7 +230,7 @@ def main():
         model_base = AutoModelForCausalLM.from_pretrained(
             base_model_path,
             torch_dtype=dtype,
-            device_map=config['device']
+            device_map=args.device
         )
         
         # Apply FACT structure
@@ -216,51 +238,61 @@ def main():
         model_fact = apply_fact_to_model(model_base, fact_config, target_modules)
         
         # Load FACT weights
-        fact_weights_path = os.path.join(config['checkpoint_dir'], "fact_adapter.bin")
-        fact_state_dict = torch.load(fact_weights_path, map_location=config['device'])
+        fact_weights_path = os.path.join(args.model, "fact_adapter.bin")
+        fact_state_dict = torch.load(fact_weights_path, map_location=args.device)
         
         # Load weights into model
         missing_keys, unexpected_keys = model_fact.load_state_dict(fact_state_dict, strict=False)
         print(f"Loaded FACT weights - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
         
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(config['checkpoint_dir'])
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
         
         model = FACTModelWrapper(model_fact, tokenizer)
         
-    elif config.get("is_lora", False):
-        print(f"Loading LoRA checkpoint: {config['checkpoint_dir']}")
+    elif args.model_type == "lora":
+        print(f"Loading LoRA checkpoint: {args.model}")
         model_peft = AutoPeftModelForCausalLM.from_pretrained(
-            config['checkpoint_dir'],
+            args.model,
             torch_dtype=dtype,
-            device_map=config['device']
+            device_map=args.device
         )
-        model = LoRAModelWrapper(model_peft, config['checkpoint_dir'])
-    else:
-        print(f"Loading full checkpoint: {config['checkpoint_dir']}")
-        model = LanguageModel(
-            model_path=config['checkpoint_dir'],
-            target_device=config['device'],
-            torch_dtype=dtype,
-        )
+        model = LoRAModelWrapper(model_peft, args.model)
         
-        # Evaluate
-        eval_results = evaluate_model(
-            model=model,
-            tokenizer=model.tokenizer,
-            dataset=test_dataset,
-            reward_function=reward_function,
-        config=config,
-        task_name=task_name
+    else:  # full checkpoint
+        print(f"Loading full checkpoint: {args.model}")
+        model = LanguageModel(
+            model_path=args.model,
+            target_device=args.device,
+            torch_dtype=dtype,
+        )
+    
+    # Evaluate model
+    print("Starting evaluation...")
+    eval_results = evaluate_model(
+        model=model,
+        tokenizer=model.tokenizer,
+        dataset=test_dataset,
+        reward_function=reward_function,
+        args=args,
+        task_name=args.task
     )
-
-    with open(config['output_file'], 'w') as f:
+    
+    # Print results
+    print(f"\nEvaluation completed!")
+    print(f"Success Rate: {eval_results['success_rate']:.4f}")
+    print(f"Average Reward: {eval_results['average_reward']:.4f}")
+    print(f"Total Samples: {eval_results['total_samples']}")
+    
+    # Save results
+    with open(args.output, 'w') as f:
         json.dump(eval_results, f, indent=4)
     
-
+    print(f"Results saved to: {args.output}")
+    
 
 if __name__ == "__main__":
     main()

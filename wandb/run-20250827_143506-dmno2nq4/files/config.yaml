@@ -1,0 +1,174 @@
+_wandb:
+    value:
+        cli_version: 0.21.1
+        e:
+            rignt4tw8w6pprfk5yab0qp1wz3jrbpj:
+                args:
+                    - --models
+                    - microsoft/Phi-3-mini-128k-instruct
+                    - --adapter
+                    - none
+                    - --lr
+                    - "3e-5"
+                    - --epochs
+                    - "2"
+                    - --batch-size
+                    - "16"
+                    - --num-answers
+                    - "8"
+                    - --max-steps
+                    - "2000"
+                    - --ckpt-dir
+                    - checkpoints/phi_full
+                    - --ckpt-interval
+                    - "0"
+                codePath: train_new.py
+                codePathLocal: train_new.py
+                cpu_count: 112
+                cpu_count_logical: 224
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "1888425144320"
+                        used: "1337042165760"
+                email: yyifan@ad.unc.edu
+                executable: /home/local/PARTNERS/yz646/miniforge/envs/grpo_s1/bin/python
+                git:
+                    commit: e98a340e2699b015d7fc1287a2fe747a0a024d38
+                    remote: https://github.com/yyifan-Onyen/grpo_s1.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-f91d9655-5e63-9c88-725f-4b85d0cc0ee3
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-9128180b-7f64-fc48-0dea-745e89b0ff7b
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-b8b33c9f-0c46-5b21-ec46-283b739d7da6
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-2591d7e2-910b-0656-db7a-f7ce3f11607c
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-01373ee3-3e1d-1de6-023e-609f32c05da4
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-83ea0fa9-a864-be0b-78c9-24f6a7d9a767
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-0feca8d9-60d5-9bdb-9d07-36ea24d47806
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-389674cb-06dd-d223-99a0-7690f87c0894
+                host: mgbaimlph100-02
+                memory:
+                    total: "2164194279424"
+                os: Linux-5.15.0-1086-nvidia-x86_64-with-glibc2.35
+                program: /home/local/PARTNERS/yz646/grpo_revision/grpo-s1/train_new.py
+                python: CPython 3.10.0
+                root: /home/local/PARTNERS/yz646/grpo_revision/grpo-s1
+                startedAt: "2025-08-27T18:35:06.261616Z"
+                writerId: rignt4tw8w6pprfk5yab0qp1wz3jrbpj
+        m: []
+        python_version: 3.10.0
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 71
+                - 98
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 71
+                - 98
+            "3":
+                - 13
+                - 16
+            "4": 3.10.0
+            "5": 0.21.1
+            "6": 4.52.4
+            "12": 0.21.1
+            "13": linux-x86_64
+adapter:
+    value: none
+adapter_alpha:
+    value: 32
+adapter_dropout:
+    value: 0.05
+adapter_rank:
+    value: 16
+adapter_scale:
+    value: 1
+adapter_target_modules:
+    value:
+        - q_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+batch_size:
+    value: 16
+beta:
+    value: 0.01
+ckpt_dir:
+    value: checkpoints/phi_full
+ckpt_interval:
+    value: 0
+dataset:
+    value: gsm8k
+dtype:
+    value: bfloat16
+epochs:
+    value: 2
+epsilon_high:
+    value: 0.2
+epsilon_low:
+    value: 0.2
+loss_type:
+    value: grpo
+lr:
+    value: 3e-05
+max_gen_len:
+    value: 512
+max_grad_norm:
+    value: 1
+max_steps:
+    value: 2000
+models:
+    value:
+        - microsoft/Phi-3-mini-128k-instruct
+num_answers:
+    value: 8
+save_final:
+    value: true
+seed:
+    value: 42
+temperature:
+    value: 1
+use_ref_model:
+    value: true
