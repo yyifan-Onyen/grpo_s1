@@ -244,6 +244,9 @@ def main(config_path: str):
                     mask = rollout_result["masks"][i]
                     prefix_token_ids = full_indices[~mask].cpu().tolist()
                     generated_token_ids = full_indices[mask].cpu().tolist()
+                    # 生成阶段的旧 log_probs（仅生成段）
+                    _old_lps = rollout_result.get("log_probs", None)
+                    old_lp = _old_lps[i].detach().cpu().tolist() if isinstance(_old_lps, list) else None
                     
                     episode_data = {
                         "prefix_token_ids": prefix_token_ids,
@@ -252,6 +255,7 @@ def main(config_path: str):
                         "completion": result,
                         "model_name": name,
                         "model_idx": model_idx,
+                        "old_log_probs": old_lp,
                     }
                     
                     model_episodes.append(episode_data)
@@ -317,6 +321,7 @@ def main(config_path: str):
                                 "prefix_token_ids": ep["prefix_token_ids"], 
                                 "generated_token_ids": ep["generated_token_ids"],
                                 "reward": ep["reward"],
+                                "old_log_probs": ep.get("old_log_probs"),
                             })
                         else:
 
@@ -382,6 +387,8 @@ def main(config_path: str):
                     epsilon_high=epsilon_high,
                     beta=beta,
                     loss_type=loss_type,
+                    ppo_mini_batch_size=config["training"].get("ppo_mini_batch_size", 0),
+                    ppo_micro_batch_size=config["training"].get("ppo_micro_batch_size", 4),
                 )
                 
                 # Store current log probs for next iteration (PPO clipping)

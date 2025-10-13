@@ -3,12 +3,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional
 import math
+import copy
+
 
 class SharedFacTLinear(nn.Module):
     """
-    Linear layer with shared FacT adaptation.
+    FacT adapter for a Linear layer with shared U/V across same-dim modules
+    and a per-layer T. Follows PETL-ViT style:
+      - U: in_features -> rank (shared)
+      - T: rank -> rank  (per-layer)
+      - V: rank -> out_features (shared, init to zeros)
+    Output: original(x) + s * (alpha / rank) * V(T(U(x))) with dropout around T.
     """
-    
+
     def __init__(
         self,
         original_layer: nn.Linear,
@@ -17,169 +24,205 @@ class SharedFacTLinear(nn.Module):
         rank: int = 64,
         alpha: int = 32,
         dropout: float = 0.1,
-        scale: float = 1.0
+        scale: float = 1.0,
     ):
         super().__init__()
         self.original_layer = original_layer
-        
-        # Get the device and dtype of the original layer
+        self.rank = int(rank)
+        self.alpha = int(alpha)
+        self.scale = float(scale)
+
+        # Device / dtype from original layer
         device = next(original_layer.parameters()).device
         dtype = next(original_layer.parameters()).dtype
-        
-        # Use shared fact_u and fact_v, create layer-specific fact_t
-        self.fact_u = shared_fact_u
-        self.fact_v = shared_fact_v
-        self.fact_t = nn.Linear(rank, rank, bias=False, dtype=dtype)
-        
-        # Initialize fact_t
+
+        # Shared U/V, per-layer T
+        self.fact_u = shared_fact_u  # in_features -> rank
+        self.fact_v = shared_fact_v  # rank -> out_features (zeros init)
+        self.fact_t = nn.Linear(self.rank, self.rank, bias=False, dtype=dtype)
+
+        # Init: PETL-ViT uses zeros for V; for T we use identity
         nn.init.eye_(self.fact_t.weight)
-        
-        # Dropout layer
+
+        # Dropout
         self.dropout = nn.Dropout(dropout)
-        self.scale = scale
-        
-        # Move fact_t to the correct device
+
+        # Move to device
         self.fact_t = self.fact_t.to(device)
         self.dropout = self.dropout.to(device)
-        
+
         # Freeze original weights
         for param in self.original_layer.parameters():
             param.requires_grad = False
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass: original + shared FacT adaptation.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            Output tensor
-        """
         original_out = self.original_layer(x)
-        
-        # Apply shared FacT: x -> U -> T -> V
-        u_out = self.fact_u(x)
-        u_out = self.dropout(u_out)
-        
-        t_out = self.fact_t(u_out)
-        t_out = self.dropout(t_out)
-        
-        v_out = self.fact_v(t_out)
-        fact_out = v_out * self.scale
-        
-        return original_out + fact_out
+
+        # U -> T -> V pathway
+        u = self.fact_u(x)
+        u = self.dropout(u)
+        t = self.fact_t(u)
+        t = self.dropout(t)
+        v = self.fact_v(t)
+
+        # Scale with alpha/rank like LoRA s
+        scaling = self.scale * (self.alpha / max(1.0, float(self.rank)))
+        return original_out + v * scaling
 
 
 def apply_shared_fact_to_model(
     model: nn.Module,
     fact_config: Dict,
-    target_modules: Optional[list] = None
+    target_modules: Optional[list] = None,
 ) -> nn.Module:
     """
-    Apply shared FacT adaptation to a model.
-    
-    Args:
-        model: The model to apply FacT to
-        fact_config: FacT configuration dictionary
-        target_modules: List of module names to apply FacT to
-        
-    Returns:
-        Model with shared FacT applied
+    Apply FacT to specified Linear submodules following PETL-ViT approach.
+
+    - For each unique (in_features, out_features) pair among target modules,
+      create shared U and V.
+    - Replace each target Linear with a wrapper that adds V(T(U(x))) to output.
+    - V weights are zero-initialized; U is Kaiming/Xavier; T is identity.
     """
     if target_modules is None:
         target_modules = ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    
-    rank = fact_config.get("fact_rank", 64)
-    alpha = fact_config.get("fact_alpha", 32)
-    dropout = fact_config.get("fact_dropout", 0.1)
-    scale = fact_config.get("fact_scale", 1.0)
-    
-    # Get the device and dtype of the model
+
+    rank = int(fact_config.get("fact_rank", 64))
+    alpha = int(fact_config.get("fact_alpha", 32))
+    dropout = float(fact_config.get("fact_dropout", 0.1))
+    scale = float(fact_config.get("fact_scale", 1.0))
+
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     print(f"Applying shared FacT to model on device: {device}, dtype: {dtype}")
-    
-    # Group modules by their dimensions to create shared components
-    dimension_groups = {}
-    
+
+    # Group Linear modules by dimensionality
+    dimension_groups: Dict[tuple[int, int], list[tuple[str, nn.Linear]]] = {}
     for name, module in model.named_modules():
         if any(target in name for target in target_modules) and isinstance(module, nn.Linear):
             dim_key = (module.in_features, module.out_features)
-            if dim_key not in dimension_groups:
-                dimension_groups[dim_key] = []
-            dimension_groups[dim_key].append((name, module))
-    
+            dimension_groups.setdefault(dim_key, []).append((name, module))
+
     print(f"Found {len(dimension_groups)} dimension groups:")
     for (in_dim, out_dim), modules in dimension_groups.items():
         print(f"  {in_dim}x{out_dim}: {len(modules)} modules")
-    
-    # Create shared components for each dimension group
-    shared_components = {}
-    
-    for (in_features, out_features), modules in dimension_groups.items():
-        # Create shared fact_u and fact_v for this dimension group
-        shared_fact_u = nn.Linear(in_features, rank, bias=False, dtype=dtype)
-        shared_fact_v = nn.Linear(rank, out_features, bias=False, dtype=dtype)
-        
-        # Initialize shared components
-        nn.init.kaiming_uniform_(shared_fact_u.weight, a=math.sqrt(5))
-        nn.init.zeros_(shared_fact_v.weight)
-        
-        # Move shared components to device
-        shared_fact_u = shared_fact_u.to(device)
-        shared_fact_v = shared_fact_v.to(device)
-        
-        shared_components[(in_features, out_features)] = (shared_fact_u, shared_fact_v)
-    
-    # Create a mapping of module names to modules for easier replacement
+
+    # Create shared U/V per dimension group
+    shared_components: Dict[tuple[int, int], tuple[nn.Linear, nn.Linear]] = {}
+    for (in_features, out_features), _ in dimension_groups.items():
+        fact_u = nn.Linear(in_features, rank, bias=False, dtype=dtype)
+        fact_v = nn.Linear(rank, out_features, bias=False, dtype=dtype)
+
+        # Init: U kaiming/xavier, V zeros (as in PETL-ViT)
+        nn.init.kaiming_uniform_(fact_u.weight, a=math.sqrt(5))
+        nn.init.zeros_(fact_v.weight)
+
+        shared_components[(in_features, out_features)] = (
+            fact_u.to(device),
+            fact_v.to(device),
+        )
+
     module_dict = dict(model.named_modules())
-    
     replaced_count = 0
-    # Replace target modules with shared FacT versions
+
+    # Replace target Linear layers with FacT wrappers
     for name, module in model.named_modules():
         if any(target in name for target in target_modules) and isinstance(module, nn.Linear):
-            # Get the device and dtype of the current module
             module_device = next(module.parameters()).device
-            module_dtype = next(module.parameters()).dtype
-            
-            # Get the shared components for this module's dimensions
             dim_key = (module.in_features, module.out_features)
-            shared_fact_u, shared_fact_v = shared_components[dim_key]
-            
-            # Create shared FacT wrapper
-            fact_module = SharedFacTLinear(
+            shared_u, shared_v = shared_components[dim_key]
+
+            fact_wrapper = SharedFacTLinear(
                 original_layer=module,
-                shared_fact_u=shared_fact_u,
-                shared_fact_v=shared_fact_v,
+                shared_fact_u=shared_u,
+                shared_fact_v=shared_v,
                 rank=rank,
                 alpha=alpha,
                 dropout=dropout,
-                scale=scale
-            )
-            
-            # Ensure FacT module is on the correct device
-            fact_module = fact_module.to(module_device)
-            
-            # Get the parent module and child name
-            name_parts = name.split('.')
-            if len(name_parts) > 1:
-                parent_name = '.'.join(name_parts[:-1])
-                child_name = name_parts[-1]
+                scale=scale,
+            ).to(module_device)
+
+            # Set back into parent
+            parts = name.split('.')
+            if len(parts) > 1:
+                parent_name = '.'.join(parts[:-1])
+                child_name = parts[-1]
                 parent = module_dict[parent_name]
-                setattr(parent, child_name, fact_module)
+                setattr(parent, child_name, fact_wrapper)
             else:
-                # Root level module
-                setattr(model, name, fact_module)
-            
+                setattr(model, name, fact_wrapper)
+
             replaced_count += 1
-            # print(f"Replaced {name} with shared FacT adapter on device {module_device}, dtype {module_dtype}")
-    
+
     print(f"Total shared FacT adapters applied: {replaced_count}")
     print(f"Shared component groups: {len(shared_components)}")
     for (in_dim, out_dim) in shared_components.keys():
         print(f"  Shared components for {in_dim}x{out_dim}")
     return model
+
+
+def _merge_shared_fact_linear_to_dense(module: "SharedFacTLinear") -> nn.Linear:
+    """
+    Merge a SharedFacTLinear wrapper into a plain nn.Linear with updated weights.
+
+    Computes W_new = W_orig + scale * (alpha/rank) * V @ T @ U, preserves bias.
+    """
+    assert isinstance(module, SharedFacTLinear), "Expected SharedFacTLinear"
+
+    original = module.original_layer
+    in_features = original.in_features
+    out_features = original.out_features
+    has_bias = original.bias is not None
+
+    device = next(original.parameters()).device
+    dtype = original.weight.dtype
+
+    # Shapes: U[r,in], T[r,r], V[out,r]
+    U = module.fact_u.weight.detach().to(device=device, dtype=dtype)
+    T = module.fact_t.weight.detach().to(device=device, dtype=dtype)
+    V = module.fact_v.weight.detach().to(device=device, dtype=dtype)
+
+    W_orig = original.weight.detach().to(device=device, dtype=dtype)  # [out,in]
+    scaling = float(module.scale) * (float(module.alpha) / max(1.0, float(module.rank)))
+    # W_add = V @ T @ U
+    W_add = (V @ T @ U) * scaling
+    W_new = W_orig + W_add
+
+    merged = nn.Linear(in_features, out_features, bias=has_bias, dtype=dtype).to(device)
+    with torch.no_grad():
+        merged.weight.copy_(W_new)
+        if has_bias:
+            merged.bias.copy_(original.bias.detach().to(device=device, dtype=dtype))
+    return merged
+
+
+def merge_fact_adapters_to_dense_copy(model: nn.Module) -> nn.Module:
+    """
+    Return a deep-copied model where all SharedFacTLinear modules
+    are replaced by merged nn.Linear layers containing W_orig + V T U.
+    """
+    new_model = copy.deepcopy(model)
+    module_dict = dict(new_model.named_modules())
+    replacements = []
+    for name, module in new_model.named_modules():
+        if isinstance(module, SharedFacTLinear):
+            merged = _merge_shared_fact_linear_to_dense(module)
+            replacements.append((name, merged))
+    for name, merged in replacements:
+        parts = name.split('.')
+        if len(parts) > 1:
+            parent_name = '.'.join(parts[:-1])
+            child_name = parts[-1]
+            parent = module_dict[parent_name]
+            setattr(parent, child_name, merged)
+            module_dict[name] = merged
+        else:
+            setattr(new_model, name, merged)
+            module_dict[name] = merged
+    if len(replacements) == 0:
+        print("[FacT] No SharedFacTLinear modules found to merge; returning a copy unchanged.")
+    else:
+        print(f"[FacT] Merged {len(replacements)} FacT-wrapped Linear layers into dense weights.")
+    return new_model
 
 
 def get_shared_fact_parameters(model: nn.Module) -> list:
