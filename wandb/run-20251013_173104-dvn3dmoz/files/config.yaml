@@ -1,0 +1,254 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        e:
+            5o6ej0lqixj3qfhdrgcxtnzg7i1m9aox:
+                args:
+                    - --models
+                    - Qwen/Qwen2.5-3B-Instruct
+                    - --adapter
+                    - fact
+                    - --dtype
+                    - bfloat16
+                    - --lr
+                    - "1e-5"
+                    - --epochs
+                    - "1"
+                    - --batch-size
+                    - "128"
+                    - --num-answers
+                    - "8"
+                    - --task-type
+                    - math
+                    - --data-root
+                    - /workspace/data
+                    - --max-steps
+                    - "100"
+                    - --ckpt-dir
+                    - /workspace/checkpoints/qwen_fact
+                    - --ckpt-interval
+                    - "0"
+                    - --no-ref-model
+                    - --use-vllm
+                    - --vllm-gpu
+                    - "1"
+                    - --vllm-gpu-mem
+                    - "0.3"
+                    - --vllm-max-model-len
+                    - "32768"
+                    - --ppo-epochs
+                    - "1"
+                    - --loss-aggregation
+                    - token-mean
+                    - --advantage-clip
+                    - "2.0"
+                    - --rollout-batch-size
+                    - "128"
+                    - --run-name
+                    - GRPO_Qwen2.5-3B-Instruct_FacT_HotUpdate_20251013_173057
+                codePath: train_new.py
+                codePathLocal: train_new.py
+                cpu_count: 112
+                cpu_count_logical: 224
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "1888425144320"
+                        used: "988979425280"
+                email: yyifan@ad.unc.edu
+                executable: /usr/bin/python3
+                git:
+                    remote: https://github.com/yyifan-Onyen/grpo_s1.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-d96d0983-1f66-acac-0864-77a272aa1d90
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-031dbb46-c957-1c12-abc1-e221734867c1
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-d02f84cf-fada-a9aa-6aaf-285e029e9de4
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-e0a968fc-1359-a0d2-2f2f-9066b13154c7
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-eb610995-c141-b053-b210-68509dd8cc3f
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-356da545-7c63-c8e1-381c-c8c676b24dc2
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-aa6b8bb0-142b-39e2-02d6-778944a150a9
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-d3492518-bebd-5e0f-2b27-f014a90ba8c0
+                host: f525288f0ef0
+                memory:
+                    total: "2164194242560"
+                os: Linux-5.15.0-1088-nvidia-x86_64-with-glibc2.35
+                program: /workspace/train_new.py
+                python: CPython 3.10.12
+                root: /workspace
+                startedAt: "2025-10-13T17:31:04.160731Z"
+                writerId: 5o6ej0lqixj3qfhdrgcxtnzg7i1m9aox
+        m:
+            - "1": train/step
+              "6":
+                - 3
+              "7": []
+            - "2": train/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": val/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.10.12
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 95
+                - 98
+                - 105
+            "2":
+                - 1
+                - 5
+                - 11
+                - 30
+                - 41
+                - 49
+                - 53
+                - 71
+                - 95
+                - 98
+                - 105
+            "3":
+                - 7
+                - 13
+                - 16
+                - 61
+            "4": 3.10.12
+            "5": 0.21.0
+            "6": 4.55.4
+            "12": 0.21.0
+            "13": linux-x86_64
+adapter:
+    value: fact
+adapter_alpha:
+    value: 32
+adapter_dropout:
+    value: 0.05
+adapter_rank:
+    value: 16
+adapter_scale:
+    value: 1
+adapter_target_modules:
+    value:
+        - q_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+advantage_clip:
+    value: 2
+batch_size:
+    value: 128
+beta:
+    value: 0.003
+ckpt_dir:
+    value: /workspace/checkpoints/qwen_fact
+ckpt_interval:
+    value: 0
+data_root:
+    value: /workspace/data
+dtype:
+    value: bfloat16
+epochs:
+    value: 1
+epsilon_high:
+    value: 0.2
+epsilon_low:
+    value: 0.2
+loss_aggregation:
+    value: token-mean
+loss_type:
+    value: grpo
+lr:
+    value: 1e-05
+max_grad_norm:
+    value: 1
+max_steps:
+    value: 100
+mode:
+    value: threshold
+models:
+    value:
+        - Qwen/Qwen2.5-3B-Instruct
+normalize_advantages:
+    value: true
+num_answers:
+    value: 8
+ppo_epochs:
+    value: 1
+ppo_micro_batch_size:
+    value: 8
+ppo_mini_batch_size:
+    value: 16
+reward_threshold:
+    value: 1
+rollout_batch_size:
+    value: 128
+run_name:
+    value: GRPO_Qwen2.5-3B-Instruct_FacT_HotUpdate_20251013_173057
+save_final:
+    value: true
+seed:
+    value: 42
+task_type:
+    value: math
+use_ref_model:
+    value: false
+use_vllm:
+    value: true
+val_batch_size:
+    value: 64
+val_interval:
+    value: 2
+vllm_gpu:
+    value: 1
+vllm_gpu_mem:
+    value: 0.3
+vllm_gpus:
+    value: null
+vllm_max_model_len:
+    value: 32768

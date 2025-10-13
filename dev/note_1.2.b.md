@@ -1,22 +1,12 @@
-# Threshold-based Answer Selection Plan
-
-## 概述
-为多模型协作训练添加threshold机制，只有质量超过阈值的其他模型答案才会被当前模型采用进行学习。
-
-## 核心思路
-- 设置质量阈值（threshold=1.0），只有完全正确的答案才会被学习
-- 每个模型只从reward=1.0的其他模型答案中学习
-- 避免模型学习到错误或低质量的回答
-
-## 实现方案
-
-### 1. 阈值设置策略
-- **固定阈值**: 设置固定的reward阈值为1.0（只学习完全正确的答案）
-- **严格过滤**: 只有reward=1.0的答案才被认为是高质量答案
-- **二元判断**: 不采用部分正确的答案，确保学习质量
-
-## 问题
-1. 有可能某次更新就不是12个sample了 可能会少 因为被过滤掉了。
-
-为什么会有adapter config
-
+root@f525288f0ef0:/workspace# pip show vllm
+Name: vllm
+Version: 0.10.0
+Summary: A high-throughput and memory-efficient inference and serving engine for LLMs
+Home-page: https://github.com/vllm-project/vllm
+Author: vLLM Team
+Author-email: 
+License-Expression: Apache-2.0
+Location: /usr/local/lib/python3.10/dist-packages
+Requires: aiohttp, blake3, cachetools, cbor2, cloudpickle, compressed-tensors, depyf, diskcache, einops, fastapi, filelock, gguf, huggingface-hub, lark, llguidance, lm-format-enforcer, mistral_common, msgspec, ninja, numba, numpy, openai, opencv-python-headless, outlines_core, partial-json-parser, pillow, prometheus-fastapi-instrumentator, prometheus_client, protobuf, psutil, py-cpuinfo, pybase64, pydantic, python-json-logger, pyyaml, pyzmq, ray, regex, requests, scipy, sentencepiece, tiktoken, tokenizers, torch, torchaudio, torchvision, tqdm, transformers, typing_extensions, watchfiles, xformers, xgrammar
+Required-by: 
+root@f525288f0ef0:/workspace# 

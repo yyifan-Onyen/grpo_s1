@@ -8,7 +8,7 @@ PYTHON=${PYTHON:-python3}
 
 # 创建必要的目录
 mkdir -p logs checkpoints
-mkdir -p checkpoints/qwen_full checkpoints/phi_full checkpoints/llama_full
+mkdir -p checkpoints/qwen_fact checkpoints/phi_fact checkpoints/llama_fact
 
 # Qwen模型训练（FacT 适配器）
 echo "Training Qwen with FacT finetuning..."
@@ -67,36 +67,36 @@ QWEN_PID=$!
 # PHI_PID=$!
 
 # Llama模型训练（FacT 适配器）
-echo "Training Llama with FacT finetuning..."
-CUDA_VISIBLE_DEVICES=4,5 ${PYTHON} train_new.py \
-  --models "meta-llama/Llama-3.2-3B-Instruct" \
-  --adapter fact \
-  --dtype bfloat16 \
-  --lr 1e-5 \
-  --epochs 1 \
-  --batch-size 64 \
-  --num-answers 8 \
-  --task-type math \
-  --data-root "/workspace/data" \
-  --max-steps 100 \
-  --ckpt-dir "/workspace/checkpoints/llama_fact" \
-  --ckpt-interval 0 \
-  --no-ref-model \
-  --use-vllm \
-  --vllm-gpu 1 \
-  --vllm-gpu-mem 0.3 \
-  --vllm-max-model-len 32768 \
-  --ppo-epochs 1 \
-  --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
-  --rollout-batch-size 128 \
-  --run-name "GRPO_Llama-3.2-3B-Instruct_fact_$(date +%Y%m%d_%H%M%S)" \
-  > logs/llama_fact.log 2>&1 &
+# echo "Training Llama with FacT finetuning..."
+# CUDA_VISIBLE_DEVICES=4,5 ${PYTHON} train_new.py \
+#   --models "meta-llama/Llama-3.2-3B-Instruct" \
+#   --adapter fact \
+#   --dtype bfloat16 \
+#   --lr 1e-5 \
+#   --epochs 1 \
+#   --batch-size 64 \
+#   --num-answers 8 \
+#   --task-type math \
+#   --data-root "/workspace/data" \
+#   --max-steps 100 \
+#   --ckpt-dir "/workspace/checkpoints/llama_fact" \
+#   --ckpt-interval 0 \
+#   --no-ref-model \
+#   --use-vllm \
+#   --vllm-gpu 1 \
+#   --vllm-gpu-mem 0.3 \
+#   --vllm-max-model-len 32768 \
+#   --ppo-epochs 1 \
+#   --loss-aggregation token-mean \
+#   --advantage-clip 2.0 \
+#   --rollout-batch-size 128 \
+#   --run-name "GRPO_Llama-3.2-3B-Instruct_fact_$(date +%Y%m%d_%H%M%S)" \
+#   > logs/llama_fact.log 2>&1 &
 
-LLAMA_PID=$!
+# LLAMA_PID=$!
 
 echo "All training started in parallel!"
-echo "PIDs: Qwen=$QWEN_PID, Llama=$LLAMA_PID"
+echo "PIDs: Qwen=$QWEN_PID"
 echo "Check logs: tail -f logs/qwen_fact.log"
 # echo "Check logs: tail -f logs/phi_fact.log" 
 echo "Check logs: tail -f logs/llama_fact.log"
@@ -108,7 +108,7 @@ echo "Qwen training completed!"
 # wait $PHI_PID
 # echo "Phi training completed!"
 
-wait $LLAMA_PID
-echo "Llama training completed!"
+# wait $LLAMA_PID
+# echo "Llama training completed!"
 
 echo "All parallel training completed!"

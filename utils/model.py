@@ -16,6 +16,7 @@ from .fact_adapter import (
     freeze_non_fact_parameters,
 )
 from .fact_adapter import merge_fact_adapters_to_dense_copy
+from .fact_adapter import SharedFacTLinear  # for detecting FacT-wrapped modules
 try:
     from vllm import LLM as VLLMEngine
     from vllm import SamplingParams as VLLMSamplingParams
@@ -55,6 +56,9 @@ class LanguageModel(object):
         self.original_model_path = model_path
         self.lora_config = lora_config
         self.fact_config = fact_config
+        # persist vLLM preferences
+        self.vllm_max_model_len = vllm_max_model_len
+        self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
         if self.tokenizer.pad_token is None:
@@ -140,10 +144,9 @@ class LanguageModel(object):
             print(f"Total model parameters: {total_params:,}")
             print(f"Shared FacT ratio: {fact_params/total_params*100:.2f}%")
             print(f"Model dtype: {next(self.model.parameters()).dtype}")
-            # vLLM cannot inject FacT online; disable vLLM for rollout
+            # vLLM 无法在线注入 FacT；如需 vLLM rollout，需要合并为 dense 后重建引擎
             if self.use_vllm:
-                print("[FacT] vLLM rollout requires merged weights; call refresh_vllm_merged_engine() to rebuild the engine.")
-                self.use_vllm = False
+                print("[FacT] vLLM rollout需要合并后重建或使用外部热更机制。")
         
         # Apply LoRA if configured (only if FacT is not used)
         elif lora_config is not None:
@@ -258,6 +261,9 @@ class LanguageModel(object):
         # Track last FacT-merged directory for vLLM refresh cycles
         self._fact_last_merged_dir: Optional[str] = None
 
+        # 不再尝试接入 VERL SPMD rollout
+        self.verl_rollout = None
+
     def export_fact_merged(self, path: str) -> str:
         """Export a dense model with FacT merged into Linear weights.
 
@@ -281,6 +287,8 @@ class LanguageModel(object):
         except Exception:
             pass
         return path
+
+    # 已移除 VERL SPMD rollout 初始化
 
     def eval_with_vLLM_on_merged(self, prompts: List[str], limitation: int = 1024, temperature: float = 0.7) -> List[str]:
         """Run evaluation with vLLM on a temporary merged-dense copy of the FacT model.
@@ -492,7 +500,11 @@ class LanguageModel(object):
         verbose: bool = False,
         return_log_probs: bool = False,
     ) -> Union[List[str], Tuple[List[str], torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]]]]:
-        """Generate text completions based on the provided prompts."""
+        """Generate text completions using vLLM only (no HF fallback)."""
+        if not (self.use_vllm and self.vllm_engine is not None):
+            raise RuntimeError(
+                "vLLM engine is not available. Enable use_vllm or build a merged engine (FacT)."
+            )
         conversations = []
         for prompt in prompts:
             conversations.append(self.tokenizer.apply_chat_template(
@@ -501,197 +513,138 @@ class LanguageModel(object):
                 add_generation_prompt=True
             ))
 
-        if self.use_vllm and self.vllm_engine is not None:
-            # vLLM SamplingParams(logprobs=k) returns top-k logprobs per token; set k=1 to get chosen-token logprob
-            try:
-                sampling = VLLMSamplingParams(
-                    temperature=float(temperature),
-                    max_tokens=int(limitation),
-                    n=1,
-                    logprobs=1 if return_log_probs else None,
-                )
-            except TypeError:
-                # Fallback for older signatures without logprobs
-                sampling = VLLMSamplingParams(
-                    temperature=float(temperature),
-                    max_tokens=int(limitation),
-                    n=1,
-                )
-            # Attach LoRA request if we have prepared adapter for vLLM
-            lora_kwargs = {}
-            if (
-                VLLMLoRARequest is not None and
-                isinstance(self.vllm_lora_adapter_name, str) and
-                isinstance(self.vllm_lora_adapter_path, str)
-            ):
-                try:
-                    lora_kwargs["lora_request"] = VLLMLoRARequest(
-                        lora_name=self.vllm_lora_adapter_name,
-                        lora_int_id=abs(hash(self.vllm_lora_adapter_name)) % (10**9),
-                        lora_path=self.vllm_lora_adapter_path,
-                    )
-                except Exception:
-                    pass
-            with torch.no_grad():
-                try:
-                    outputs = self.vllm_engine.generate(conversations, sampling, **lora_kwargs)
-                except TypeError:
-                    # Older vLLM without lora_request in generate; fall back to no-arg call (adapter may be set globally)
-                    outputs = self.vllm_engine.generate(conversations, sampling)
-            completions = [o.outputs[0].text for o in outputs]
-            # Prefer token ids from vLLM if available to avoid retokenization mismatch
-            # Batch-tokenize conversation prefixes to reduce per-item overhead
-            try:
-                _prefix_tok = self.tokenizer(conversations, add_special_tokens=False, return_tensors=None)
-                if isinstance(_prefix_tok, dict) and "input_ids" in _prefix_tok:
-                    prefix_ids_list = _prefix_tok["input_ids"]
-                    if hasattr(prefix_ids_list, "tolist"):
-                        # torch / numpy tensor -> list
-                        prefix_ids_list = prefix_ids_list.tolist()
-                    elif isinstance(prefix_ids_list, list):
-                        # already a python list-of-lists; keep as-is
-                        pass
-                    else:
-                        # unknown structure
-                        prefix_ids_list = []
-                else:
-                    prefix_ids_list = []
-            except Exception:
-                prefix_ids_list = []
-            if not prefix_ids_list or len(prefix_ids_list) != len(conversations):
-                if not prefix_ids_list:
-                    print("[tokenizer] fallback to per-item prefix tokenization (empty batch result)")
-                else:
-                    print(
-                        f"[tokenizer] fallback to per-item prefix tokenization (batch size mismatch: "
-                        f"{len(prefix_ids_list)} != {len(conversations)})"
-                    )
-                prefix_ids_list = []
-                for conv in conversations:
-                    try:
-                        ids = self.tokenizer(conv, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
-                    except Exception:
-                        ids = []
-                    prefix_ids_list.append(ids)
-            gen_ids_list = []
-            vllm_log_probs_list: Optional[List[torch.Tensor]] = [] if return_log_probs else None
-            for conv, out in zip(conversations, outputs):
-                try:
-                    gen_token_ids = out.outputs[0].token_ids
-                except Exception:
-                    # Fallback: retokenize completion text
-                    gen_token_ids = self.tokenizer(out.outputs[0].text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
-                gen_ids_list.append(gen_token_ids)
-                if return_log_probs:
-                    try:
-                        # vLLM returns per-token logprobs for generated tokens if requested
-                        token_logprobs = []
-                        for tk in out.outputs[0].logprobs:
-                            # logprobs is a list per token; take the chosen token's logprob if present
-                            if tk is None:
-                                token_logprobs.append(float("nan"))
-                            else:
-                                # tk could be a dict mapping token->logprob or a structure with .logprob
-                                if hasattr(tk, 'logprob'):
-                                    token_logprobs.append(float(tk.logprob))
-                                elif isinstance(tk, dict):
-                                    # find the token id we chose
-                                    chosen_id = gen_token_ids[len(token_logprobs)] if len(gen_token_ids) > len(token_logprobs) else None
-                                    if chosen_id is not None and chosen_id in tk:
-                                        token_logprobs.append(float(tk[chosen_id]))
-                                    else:
-                                        # take max
-                                        token_logprobs.append(float(max(tk.values())))
-                                else:
-                                    # Unknown structure; skip
-                                    token_logprobs.append(float("nan"))
-                        vllm_log_probs_list.append(torch.tensor(token_logprobs, dtype=torch.float32, device=self.device))
-                    except Exception:
-                        vllm_log_probs_list.append(None)  # type: ignore
-            if not prefix_ids_list or not gen_ids_list:
-                max_len = 0
-            else:
-                max_len = max(len(p) + len(g) for p, g in zip(prefix_ids_list, gen_ids_list))
-            pad_id = self.tokenizer.pad_token_id
-            indices_list = []
-            masks_list = []
-            for p_ids, g_ids in zip(prefix_ids_list, gen_ids_list):
-                seq = p_ids + g_ids
-                pad_len = max_len - len(seq)
-                indices_list.append(seq + [pad_id] * max(pad_len, 0))
-                mask = [False] * len(p_ids) + [True] * len(g_ids) + [False] * max(pad_len, 0)
-                masks_list.append(mask)
-            if len(indices_list) == 0:
-                indices = torch.empty((0, 0), dtype=torch.long, device=self.device)
-                masks = torch.empty((0, 0), dtype=torch.bool, device=self.device)
-            else:
-                indices = torch.tensor(indices_list, dtype=torch.long, device=self.device)
-                masks = torch.tensor(masks_list, dtype=torch.bool, device=self.device)
-        else:
-            inputs = self.tokenizer(
-                conversations,
-                padding=True,
-                padding_side="left",
-                add_special_tokens=False,
-                return_tensors="pt"
+        # vLLM SamplingParams(logprobs=k) returns top-k logprobs per token; set k=1 to get chosen-token logprob
+        try:
+            sampling = VLLMSamplingParams(
+                temperature=float(temperature),
+                max_tokens=int(limitation),
+                n=1,
+                logprobs=1 if return_log_probs else None,
             )
-            
-            # Move inputs to model's device
-            device = next(self.model.parameters()).device
-            inputs = inputs.to(device)
-
-            # Temporarily switch to inference-friendly mode to avoid OOM with gradient checkpointing
-            prev_training = self.model.training
-            prev_use_cache = getattr(self.model.config, "use_cache", True)
-            had_gc = getattr(self.model, "is_gradient_checkpointing", False)
-
-            self.model.eval()
+        except TypeError:
+            # Fallback for older signatures without logprobs
+            sampling = VLLMSamplingParams(
+                temperature=float(temperature),
+                max_tokens=int(limitation),
+                n=1,
+            )
+        # Attach LoRA request if we have prepared adapter for vLLM
+        lora_kwargs = {}
+        if (
+            VLLMLoRARequest is not None and
+            isinstance(self.vllm_lora_adapter_name, str) and
+            isinstance(self.vllm_lora_adapter_path, str)
+        ):
             try:
-                self.model.gradient_checkpointing_disable()
-            except Exception:
-                pass
-            try:
-                self.model.config.use_cache = True
-            except Exception:
-                pass
-
-            with torch.inference_mode():
-                indices = self.model.generate(
-                    **inputs,
-                    generation_config=GenerationConfig(
-                        max_new_tokens=limitation,
-                        do_sample=True,
-                        temperature=temperature,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                    )
+                lora_kwargs["lora_request"] = VLLMLoRARequest(
+                    lora_name=self.vllm_lora_adapter_name,
+                    lora_int_id=abs(hash(self.vllm_lora_adapter_name)) % (10**9),
+                    lora_path=self.vllm_lora_adapter_path,
                 )
-                length = inputs["input_ids"].shape[1]
-                completions = self.tokenizer.batch_decode(
-                    indices[:, length:],
-                    skip_special_tokens=True
-                )
-                masks = torch.zeros_like(indices, dtype=torch.bool)
-                masks[:, length:] = True
-                masks[indices == self.tokenizer.pad_token_id] = False
-
-            # Restore training-time settings
-            try:
-                self.model.config.use_cache = prev_use_cache
             except Exception:
                 pass
-            if had_gc:
-                try:
-                    self.model.gradient_checkpointing_enable()
-                except Exception:
+        with torch.no_grad():
+            try:
+                outputs = self.vllm_engine.generate(conversations, sampling, **lora_kwargs)
+            except TypeError:
+                # Older vLLM without lora_request in generate; fall back to no-arg call (adapter may be set globally)
+                outputs = self.vllm_engine.generate(conversations, sampling)
+        completions = [o.outputs[0].text for o in outputs]
+        # Prefer token ids from vLLM if available to avoid retokenization mismatch
+        # Batch-tokenize conversation prefixes to reduce per-item overhead
+        try:
+            _prefix_tok = self.tokenizer(conversations, add_special_tokens=False, return_tensors=None)
+            if isinstance(_prefix_tok, dict) and "input_ids" in _prefix_tok:
+                prefix_ids_list = _prefix_tok["input_ids"]
+                if hasattr(prefix_ids_list, "tolist"):
+                    # torch / numpy tensor -> list
+                    prefix_ids_list = prefix_ids_list.tolist()
+                elif isinstance(prefix_ids_list, list):
+                    # already a python list-of-lists; keep as-is
                     pass
-            if prev_training:
-                self.model.train()
-            vllm_log_probs_list = None
+                else:
+                    # unknown structure
+                    prefix_ids_list = []
+            else:
+                prefix_ids_list = []
+        except Exception:
+            prefix_ids_list = []
+        if not prefix_ids_list or len(prefix_ids_list) != len(conversations):
+            if not prefix_ids_list:
+                print("[tokenizer] fallback to per-item prefix tokenization (empty batch result)")
+            else:
+                print(
+                    f"[tokenizer] fallback to per-item prefix tokenization (batch size mismatch: "
+                    f"{len(prefix_ids_list)} != {len(conversations)})"
+                )
+            prefix_ids_list = []
+            for conv in conversations:
+                try:
+                    ids = self.tokenizer(conv, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
+                except Exception:
+                    ids = []
+                prefix_ids_list.append(ids)
+        gen_ids_list = []
+        vllm_log_probs_list: Optional[List[torch.Tensor]] = [] if return_log_probs else None
+        for conv, out in zip(conversations, outputs):
+            try:
+                gen_token_ids = out.outputs[0].token_ids
+            except Exception:
+                # Fallback: retokenize completion text
+                gen_token_ids = self.tokenizer(out.outputs[0].text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
+            gen_ids_list.append(gen_token_ids)
+            if return_log_probs:
+                try:
+                    # vLLM returns per-token logprobs for generated tokens if requested
+                    token_logprobs = []
+                    for tk in out.outputs[0].logprobs:
+                        # logprobs is a list per token; take the chosen token's logprob if present
+                        if tk is None:
+                            token_logprobs.append(float("nan"))
+                        else:
+                            # tk could be a dict mapping token->logprob or a structure with .logprob
+                            if hasattr(tk, 'logprob'):
+                                token_logprobs.append(float(tk.logprob))
+                            elif isinstance(tk, dict):
+                                # find the token id we chose
+                                chosen_id = gen_token_ids[len(token_logprobs)] if len(gen_token_ids) > len(token_logprobs) else None
+                                if chosen_id is not None and chosen_id in tk:
+                                    token_logprobs.append(float(tk[chosen_id]))
+                                else:
+                                    # take max
+                                    token_logprobs.append(float(max(tk.values())))
+                            else:
+                                # Unknown structure; skip
+                                token_logprobs.append(float("nan"))
+                    vllm_log_probs_list.append(torch.tensor(token_logprobs, dtype=torch.float32, device=self.device))
+                except Exception:
+                    vllm_log_probs_list.append(None)  # type: ignore
+        if not prefix_ids_list or not gen_ids_list:
+            max_len = 0
+        else:
+            max_len = max(len(p) + len(g) for p, g in zip(prefix_ids_list, gen_ids_list))
+        pad_id = self.tokenizer.pad_token_id
+        indices_list = []
+        masks_list = []
+        for p_ids, g_ids in zip(prefix_ids_list, gen_ids_list):
+            seq = p_ids + g_ids
+            pad_len = max_len - len(seq)
+            indices_list.append(seq + [pad_id] * max(pad_len, 0))
+            mask = [False] * len(p_ids) + [True] * len(g_ids) + [False] * max(pad_len, 0)
+            masks_list.append(mask)
+        if len(indices_list) == 0:
+            indices = torch.empty((0, 0), dtype=torch.long, device=self.device)
+            masks = torch.empty((0, 0), dtype=torch.bool, device=self.device)
+        else:
+            indices = torch.tensor(indices_list, dtype=torch.long, device=self.device)
+            masks = torch.tensor(masks_list, dtype=torch.bool, device=self.device)
 
         if verbose:
             return completions, indices, masks, vllm_log_probs_list
         else:
             return completions
+
+    # 已移除 VERL SPMD 生成路径
 
     def sync_lora_to_vllm(self, adapter_name: str = "peft") -> bool:
         """Export current PEFT LoRA adapter and load it into vLLM engine.
@@ -789,6 +742,183 @@ class LanguageModel(object):
             pass
         torch.save(self.model.state_dict(), os.path.join(path, "pytorch_model.bin"))
         print("Model saved (manual state_dict)")
+
+    # -------------------- vLLM hot update (dense/FacT, TP=1) --------------------
+    def _get_vllm_internal_model(self):
+        """Locate vLLM's internal model object for load_weights.
+
+        Returns None if vLLM engine is not available.
+        """
+        if not (self.use_vllm and self.vllm_engine is not None):
+            return None
+        candidates = [
+            # Common paths across vLLM versions
+            "llm_engine.model_executor.driver_worker.worker.model_runner.model",
+            "llm_engine.model_executor.driver_worker.model_runner.model",
+            "llm_engine.model_executor.model_runner.model",
+            # Some builds expose an alias `engine`
+            "engine.llm_engine.model_executor.driver_worker.worker.model_runner.model",
+            "engine.model_executor.driver_worker.worker.model_runner.model",
+        ]
+        obj = self.vllm_engine
+        for path in candidates:
+            cur = obj
+            ok = True
+            for seg in path.split("."):
+                if not hasattr(cur, seg):
+                    ok = False
+                    break
+                cur = getattr(cur, seg)
+            if ok:
+                return cur
+        # Fallback: bounded BFS to locate an object exposing `load_weights`
+        try:
+            from collections import deque
+
+            def has_loader(x):
+                try:
+                    return hasattr(x, "load_weights") and callable(getattr(x, "load_weights"))
+                except Exception:
+                    return False
+
+            seen = set()
+            q = deque()
+            seed = [obj]
+            if hasattr(obj, "llm_engine"):
+                seed.append(getattr(obj, "llm_engine"))
+            for s in seed:
+                q.append((s, 0))
+                try:
+                    seen.add(id(s))
+                except Exception:
+                    pass
+
+            MAX_DEPTH = 4
+            MAX_NODES = 2048
+            visited_nodes = 0
+
+            while q and visited_nodes < MAX_NODES:
+                cur, depth = q.popleft()
+                visited_nodes += 1
+                if has_loader(cur):
+                    return cur
+                if depth >= MAX_DEPTH:
+                    continue
+                # Iterate attributes conservatively
+                try:
+                    for name in dir(cur):
+                        if name.startswith("__"):
+                            continue
+                        # Skip obvious huge or irrelevant attrs
+                        if name in ("__dict__", "__class__", "__weakref__"):
+                            continue
+                        try:
+                            nxt = getattr(cur, name)
+                        except Exception:
+                            continue
+                        # Skip basic types
+                        if isinstance(nxt, (int, float, str, bytes, bool, tuple, list, dict, set)):
+                            continue
+                        # Skip callables
+                        if callable(nxt):
+                            continue
+                        nid = None
+                        try:
+                            nid = id(nxt)
+                        except Exception:
+                            nid = None
+                        if nid is not None and nid in seen:
+                            continue
+                        if nid is not None:
+                            seen.add(nid)
+                        q.append((nxt, depth + 1))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    @torch.no_grad()
+    def hot_update_vllm_full_weights(self) -> bool:
+        """Hot update vLLM weights in-place (no engine restart).
+
+        - Dense: stream HF state_dict tensors.
+        - FacT: on-the-fly merge FacT-wrapped Linear to effective dense weights, skip fact_*.
+
+        Only recommended when tensor_parallel_size == 1 and engine colocates in the same process.
+        Returns True if successfully dispatched to vLLM.
+        """
+
+        internal_model = self._get_vllm_internal_model()
+        if internal_model is None:
+            return False
+
+        # Optional: For MoE models you may need to patch weight_loader
+        try:
+            # Import from vendored VERL if available
+            from reference_works.verl.verl.utils.vllm.patch import (
+                patch_vllm_moe_model_weight_loader,
+            )
+
+            try:
+                patch_vllm_moe_model_weight_loader(internal_model)
+            except Exception:
+                pass
+        except Exception:
+            # Not required for Qwen/LLaMA/Phi dense models
+            pass
+
+        # Build map of FacT wrapped modules so we can emit merged weights with original HF keys
+        fact_wrapped: Dict[str, SharedFacTLinear] = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, SharedFacTLinear):
+                fact_wrapped[name] = module
+
+        sd = self.model.state_dict()
+        visited: set[str] = set()
+
+        def gen():
+            # 1) Emit merged weights for FacT-wrapped Linear modules
+            for mname, mod in fact_wrapped.items():
+                # Compute effective dense weight on the same device/dtype, then move to CPU for stability
+                original = mod.original_layer
+                W_orig = original.weight.detach()
+                device = W_orig.device
+                dtype = W_orig.dtype
+                # Shapes: U[r,in], T[r,r], V[out,r]
+                U = mod.fact_u.weight.detach().to(device=device, dtype=dtype)
+                T = mod.fact_t.weight.detach().to(device=device, dtype=dtype)
+                V = mod.fact_v.weight.detach().to(device=device, dtype=dtype)
+                scaling = float(mod.scale) * (float(mod.alpha) / max(1.0, float(mod.rank)))
+                W_add = (V @ T @ U) * scaling
+                W_eff = W_orig + W_add
+
+                weight_key = f"{mname}.weight"
+                yield weight_key, W_eff.detach().cpu().contiguous()
+                visited.add(weight_key)
+
+                if original.bias is not None:
+                    bias_key = f"{mname}.bias"
+                    yield bias_key, original.bias.detach().cpu().contiguous()
+                    visited.add(bias_key)
+
+            # 2) Emit the rest of tensors (skip FacT internals and original_layer.* placeholders)
+            for k, v in sd.items():
+                if ".fact_" in k or ".original_layer." in k:
+                    continue
+                if k in visited:
+                    continue
+                yield k, v.detach().cpu().contiguous()
+
+        internal_model.load_weights(gen())
+
+        # Best-effort clear prefix cache if supported by engine to avoid stale KV
+        try:
+            if hasattr(self.vllm_engine, "reset_prefix_cache"):
+                self.vllm_engine.reset_prefix_cache()
+        except Exception:
+            pass
+        return True
 
 
 if __name__ == "__main__":

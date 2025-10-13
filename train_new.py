@@ -719,7 +719,7 @@ def main():
     lr_adapt_ema = [None for _ in range(num_models)]
     # Holds the latest batch's self rollout mean reward per model (reset after each update)
     batch_self_reward_mean = [None for _ in range(num_models)]
-
+    
     # Storage for old log probabilities (for PPO clipping)
     old_log_probs_storage = [None] * num_models
     
@@ -913,13 +913,15 @@ def main():
                                     cross_selected.append(random.choice(other_eps_q))
 
                                 for ep in own_selected:
-                                    group.append({
-                                        "prefix_token_ids": ep["prefix_token_ids"],
-                                        "generated_token_ids": ep["generated_token_ids"],
-                                        "reward": ep.get("reward"),
-                                        "completion": ep.get("completion"),
-                                        "old_log_probs": ep.get("old_log_probs"),
-                                    })
+                                    group.append(
+                                        {
+                                "prefix_token_ids": ep["prefix_token_ids"], 
+                                "generated_token_ids": ep["generated_token_ids"],
+                                            "reward": ep.get("reward"),
+                                            "completion": ep.get("completion"),
+                                "old_log_probs": ep.get("old_log_probs"),
+                                        }
+                                    )
 
                                 for ep in cross_selected:
                                     new_completion_ids = ep_id_to_ids.get(id(ep))
@@ -927,7 +929,7 @@ def main():
                                         try:
                                             _single = tokenizer(
                                                 ep.get("completion", ""),
-                                                return_tensors="pt",
+                                    return_tensors="pt", 
                                                 add_special_tokens=False,
                                             )
                                             new_completion_ids = _single["input_ids"][0].tolist()
@@ -947,13 +949,15 @@ def main():
                                         converted_ids.append(tid_int)
                                     if not valid:
                                         continue
-                                    group.append({
+                                    group.append(
+                                        {
                                         "prefix_token_ids": own_prefix, 
-                                        "generated_token_ids": converted_ids,
-                                        "reward": ep.get("reward"),
-                                        "completion": ep.get("completion"),
-                                        "old_log_probs": ep.get("old_log_probs"),
-                                    })
+                                            "generated_token_ids": converted_ids,
+                                            "reward": ep.get("reward"),
+                                            "completion": ep.get("completion"),
+                                            "old_log_probs": ep.get("old_log_probs"),
+                                        }
+                                    )
 
                             else:  # args.mode in {"threshold", "weight"}
                                 own_pos = [
@@ -998,22 +1002,26 @@ def main():
                                         converted_ids.append(tid_int)
                                     if not valid:
                                         continue
-                                    cross_pos.append({
-                                        "prefix_token_ids": own_prefix,
-                                        "generated_token_ids": converted_ids,
-                                        "reward": ep.get("reward"),
-                                        "completion": ep.get("completion"),
-                                        "old_log_probs": ep.get("old_log_probs"),
-                                    })
+                                    cross_pos.append(
+                                        {
+                                            "prefix_token_ids": own_prefix,
+                                            "generated_token_ids": converted_ids,
+                                            "reward": ep.get("reward"),
+                                            "completion": ep.get("completion"),
+                                            "old_log_probs": ep.get("old_log_probs"),
+                                        }
+                                    )
 
                                 for ep in own_pos:
-                                    group.append({
-                                        "prefix_token_ids": ep["prefix_token_ids"],
-                                        "generated_token_ids": ep["generated_token_ids"],
-                                        "reward": ep["reward"],
-                                        "completion": ep.get("completion"),
-                                        "old_log_probs": ep.get("old_log_probs"),
-                                    })
+                                    group.append(
+                                        {
+                                            "prefix_token_ids": ep["prefix_token_ids"],
+                                            "generated_token_ids": ep["generated_token_ids"],
+                                            "reward": ep["reward"],
+                                            "completion": ep.get("completion"),
+                                            "old_log_probs": ep.get("old_log_probs"),
+                                        }
+                                    )
 
                                 need = max(0, num_completions_per_prompt - len(group))
                                 if need > 0 and cross_pos:
@@ -1025,23 +1033,27 @@ def main():
                                     own_neg_shuffled = own_neg.copy()
                                     random.shuffle(own_neg_shuffled)
                                     for ep in own_neg_shuffled[:need2]:
-                                        group.append({
-                                            "prefix_token_ids": ep["prefix_token_ids"],
-                                            "generated_token_ids": ep["generated_token_ids"],
-                                            "reward": ep["reward"],
-                                            "completion": ep.get("completion"),
-                                            "old_log_probs": ep.get("old_log_probs"),
-                                        })
+                                        group.append(
+                                            {
+                                                "prefix_token_ids": ep["prefix_token_ids"],
+                                                "generated_token_ids": ep["generated_token_ids"],
+                                                "reward": ep["reward"],
+                                                "completion": ep.get("completion"),
+                                                "old_log_probs": ep.get("old_log_probs"),
+                                            }
+                                        )
 
                             while len(group) < num_completions_per_prompt and own_eps_q:
                                 filler_ep = random.choice(own_eps_q)
-                                group.append({
-                                    "prefix_token_ids": filler_ep["prefix_token_ids"],
-                                    "generated_token_ids": filler_ep["generated_token_ids"],
-                                    "reward": filler_ep.get("reward"),
-                                    "completion": filler_ep.get("completion"),
-                                    "old_log_probs": filler_ep.get("old_log_probs"),
-                                })
+                                group.append(
+                                    {
+                                        "prefix_token_ids": filler_ep["prefix_token_ids"],
+                                        "generated_token_ids": filler_ep["generated_token_ids"],
+                                        "reward": filler_ep.get("reward"),
+                                        "completion": filler_ep.get("completion"),
+                                        "old_log_probs": filler_ep.get("old_log_probs"),
+                                    }
+                                )
 
                             if len(group) > num_completions_per_prompt:
                                 group = group[:num_completions_per_prompt]
@@ -1380,31 +1392,30 @@ def main():
                                 f"Clip ratio: {update_result['clip_ratio']:.4f}"
                             )
 
-                            if _WANDB_AVAILABLE:
-                                try:
-                                    wandb.log({
-                                        f"train/loss/{name}": float(update_result["loss"]),
-                                        f"train/grad_norm/{name}": float(update_result["grad_norm"]),
-                                        f"train/entropy/{name}": float(update_result["entropy"]),
-                                        f"train/kl_div/{name}": float(update_result["kl_div"]),
-                                        f"train/clip_ratio/{name}": float(update_result["clip_ratio"]),
-                                        "train/step": batch_step,
-                                    }, step=batch_step)
-                                except Exception as _e:
-                                    print(f"[wandb] log failed: {_e}")
-                    
-                            # Refresh vLLM FacT engine if needed (do this in main thread to avoid engine races)
-                            model = models[model_idx]
-                            if getattr(args, "use_vllm", False) and has_fact:
-                                try:
-                                    refresh_ok = model.refresh_vllm_merged_engine(
-                                        gpu_memory_utilization=getattr(args, "vllm_gpu_mem", 0.6),
-                                        max_model_len=getattr(args, "vllm_max_model_len", None),
-                                    )
-                                    if not refresh_ok:
-                                        print(f"[FacT] {name}: vLLM engine refresh failed; continuing with HF rollout.")
-                                except Exception as _refresh_e:
-                                    print(f"[FacT] {name}: vLLM refresh error: {_refresh_e}")
+                    if _WANDB_AVAILABLE:
+                        try:
+                            wandb.log({
+                                f"train/loss/{name}": float(update_result["loss"]),
+                                f"train/grad_norm/{name}": float(update_result["grad_norm"]),
+                                f"train/entropy/{name}": float(update_result["entropy"]),
+                                f"train/kl_div/{name}": float(update_result["kl_div"]),
+                                f"train/clip_ratio/{name}": float(update_result["clip_ratio"]),
+                                "train/step": batch_step,
+                            }, step=batch_step)
+                        except Exception as _e:
+                            print(f"[wandb] log failed: {_e}")
+
+                    # Hot-update vLLM weights without engine restart (dense/FacT)
+                    # Do this in main thread to avoid engine races with vLLM
+                    model = models[model_idx]
+                    if getattr(args, "use_vllm", False):
+                        ok = False
+                        if hasattr(model, "hot_update_vllm_full_weights"):
+                            ok = bool(model.hot_update_vllm_full_weights())
+                        if not ok:
+                            raise RuntimeError(
+                                f"[vLLM] {name}: hot update failed; aborting (no restart fallback)."
+                            )
                     
                     torch.cuda.empty_cache()
                     gc.collect()
