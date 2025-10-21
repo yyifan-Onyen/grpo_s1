@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 import gc
 import os
-import ipdb
 import math
 import numpy as np
 import torch
@@ -116,7 +115,8 @@ def _rollout_model_batch(
             limitation=max_gen_len,
             temperature=temperature,
             verbose=True,
-            return_log_probs=bool(getattr(model, "use_vllm", False)),
+            # OpenRLHF-style: vLLM 仅用于生成，旧策略对数概率由 HF/Actor 计算
+            return_log_probs=False,
         )
         for j, result in enumerate(completions):
             q_idx = chunk_qrefs[j]
@@ -132,11 +132,53 @@ def _rollout_model_batch(
             prefix_token_ids = fi_cpu[~mk_cpu].tolist()
             generated_token_ids = fi_cpu[mk_cpu].tolist()
             old_lp = None
-            if isinstance(vllm_lps, list) and j < len(vllm_lps) and vllm_lps[j] is not None:
+            # 使用 HF/Actor 计算旧策略对数概率（OpenRLHF/VERL 风格），避免依赖 vLLM 的 logprobs
+            try:
+                # 将当前样本的序列搬到训练设备上计算对数概率
+                input_ids = full_indices[:-1].clone().unsqueeze(0).to(device)
+                target_ids = full_indices[1:].clone().unsqueeze(0).to(device)
+                target_masks = mask[1:].clone().unsqueeze(0).to(device)
+
+                # 暂时切换到推理友好设置，避免梯度检查点与 use_cache 干扰
+                prev_training = model.model.training
+                prev_use_cache = getattr(model.model.config, "use_cache", True)
+                had_gc = getattr(model.model, "is_gradient_checkpointing", False)
+                model.model.eval()
                 try:
-                    old_lp = vllm_lps[j].detach().cpu().tolist()
+                    model.model.gradient_checkpointing_disable()
                 except Exception:
-                    old_lp = None
+                    pass
+                try:
+                    model.model.config.use_cache = True
+                except Exception:
+                    pass
+                with torch.inference_mode():
+                    lp = get_log_probs(
+                        model.model,
+                        input_ids,
+                        target_ids,
+                        target_masks,
+                        pad_token_id=tokenizer.pad_token_id,
+                        vocab_size=model.model.config.vocab_size,
+                        return_logits=False,
+                    )
+                old_lp = lp[0][target_masks[0]].detach().cpu().tolist()
+            except Exception as _e:
+                print(f"[TRAIN] old_log_probs (multi-model) fallback failed: {_e}")
+                old_lp = None
+            finally:
+                # 恢复训练时设置
+                try:
+                    model.model.config.use_cache = prev_use_cache
+                except Exception:
+                    pass
+                if had_gc:
+                    try:
+                        model.model.gradient_checkpointing_enable()
+                    except Exception:
+                        pass
+                if prev_training:
+                    model.model.train()
             episode = {
                 "prefix_token_ids": prefix_token_ids,
                 "generated_token_ids": generated_token_ids,
@@ -244,7 +286,7 @@ def main():
                        help="PPO clipping lower bound")
     parser.add_argument("--epsilon-high", type=float, default=0.2,
                        help="PPO clipping upper bound")
-    parser.add_argument("--beta", type=float, default=0.003,
+    parser.add_argument("--beta", type=float, default=0.1,
                        help="KL divergence coefficient (default aligns with VERL)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                        help="Maximum gradient norm")
@@ -264,7 +306,7 @@ def main():
     parser.add_argument("--task-type", choices=["math", "code"], default="math",
                        help="Task type to determine verifier and dataset schema")
     parser.add_argument("--data-root", type=str,
-                       default="/home/local/PARTNERS/yz646/grpo_s1/data",
+                       default="/workspace/data",
                        help="Root directory containing datasets (expects MATH/ or CODE/ subfolders)")
     # 阈值模式（选择跨模型样本）
     parser.add_argument("--mode", choices=["random", "threshold", "weight"], default="threshold",
@@ -274,7 +316,7 @@ def main():
     # 验证配置（以策略更新步 step 为单位）
     parser.add_argument("--val-interval", type=int, default=2,
                        help="Validation frequency in policy update steps (step)")
-    parser.add_argument("--val-batch-size", type=int, default=64,
+    parser.add_argument("--val-batch-size", type=int, default=128,
                        help="Validation decode batch size (number of prompts decoded in parallel)")
     
     # 解码/加速选项
@@ -288,7 +330,7 @@ def main():
                        help="Per-model vLLM GPU local indices (within CUDA_VISIBLE_DEVICES). Provide N entries for N models.")
     parser.add_argument("--vllm-max-model-len", type=int, default=32768,
                        help="Max model length for vLLM to cap KV cache size and avoid OOM (e.g., 32768).")
-    parser.add_argument("--rollout-batch-size", type=int, default=64,
+    parser.add_argument("--rollout-batch-size", type=int, default=128,
                        help="Decode batch size for rollout (number of prompts decoded together across questions).")
 
     
@@ -443,27 +485,31 @@ def main():
 
     tokenizers = [model.tokenizer for model in models]
 
-    # FacT + vLLM：训练开始前进行一次初始合并并启动 vLLM 引擎用于随后的 rollout
-    try:
+    # 若启用 vLLM：在首次解码前进行一次逐参数热更新，使首个 rollout 即使用 vLLM 权重
+    if getattr(args, "use_vllm", False):
         for model, name in zip(models, model_names):
-            if getattr(args, "use_vllm", False) and getattr(model, "fact_config", None) is not None:
-                ok = model.refresh_vllm_merged_engine(
-                    gpu_memory_utilization=getattr(args, "vllm_gpu_mem", 0.6),
-                    max_model_len=getattr(args, "vllm_max_model_len", None),
-                )
-                print(f"[FacT] Initial merged vLLM for {name}: {'OK' if ok else 'FAIL'}")
-    except Exception as _e:
-        print(f"[FacT] Initial merged vLLM refresh error: {_e}")
+            try:
+                if getattr(model, "use_vllm", False) and (
+                    getattr(model, "vllm_worker", None) is not None or getattr(model, "vllm_engine", None) is not None
+                ):
+                    # Skip hot update for LoRA; vLLM supports native LoRA adapters
+                    if getattr(model, "lora_config", None) is not None:
+                        continue
+                    ok = False
+                    if hasattr(model, "hot_update_vllm_full_weights"):
+                        ok = bool(model.hot_update_vllm_full_weights())
+                    if not ok:
+                        raise RuntimeError(f"[vLLM] {name}: initial hot update failed (no fallback).")
+            except Exception as _e:
+                raise
 
     # 依据 task-type 解析数据路径（由 data-root + 子目录 推断）
     _data_root = args.data_root
     if args.task_type == "math":
-        train_path = f"{_data_root}/MATH/train.json"
-        test_path = f"{_data_root}/MATH/test.json"
+        train_path = f"{_data_root}/MATH_BLEND/train.json"
     elif args.task_type == "code":
         # 使用 MBPP 作为代码数据集
         train_path = f"{_data_root}/MBPP/train.json"
-        test_path = f"{_data_root}/MBPP/test.json"
     else:
         print(f"Unsupported task type: {args.task_type}")
         return
@@ -489,13 +535,11 @@ def main():
 
     if args.task_type == "math":
         train_dataset = load_math_json(train_path)
-        test_dataset = load_math_json(test_path)
         from verifiers.verifier_math import math_reward_function as _math_reward_function
         def reward_fn(response, sample):
             return _math_reward_function(response, sample["solution"])
     elif args.task_type == "code":
         train_dataset = load_mbpp_json(train_path)
-        test_dataset = load_mbpp_json(test_path)
         from verifiers.verifier_coding import verify_answer as _code_verify_answer
         def reward_fn(response, sample):
             try:
@@ -556,16 +600,20 @@ def main():
 
                 # 优先使用持久化的 vLLM 引擎（线程安全），必要时退回一次性合并评估
                 def _gen_eval(_prompts: List[str]):
+                    # 验证优先使用已有 vLLM worker/engine；避免每次导出合并并新建临时引擎
                     try:
                         if getattr(args, "use_vllm", False):
-                            if getattr(_model, "fact_config", None) is not None and getattr(_model, "vllm_engine", None) is not None:
-                                return _model.generate(prompts=_prompts, limitation=MAX_GEN_LEN, temperature=VAL_TEMPERATURE, verbose=False)
-                            elif getattr(_model, "fact_config", None) is not None:
-                                # FacT 无持久引擎时的兜底方案
-                                return _model.eval_with_vLLM_on_merged(_prompts, limitation=MAX_GEN_LEN, temperature=VAL_TEMPERATURE)
+                            if getattr(_model, "vllm_worker", None) is not None or getattr(_model, "vllm_engine", None) is not None:
+                                return _model.generate(
+                                    prompts=_prompts,
+                                    limitation=MAX_GEN_LEN,
+                                    temperature=VAL_TEMPERATURE,
+                                    verbose=False,
+                                )
                     except Exception:
                         pass
-                    return _model.generate(prompts=_prompts, limitation=MAX_GEN_LEN, temperature=VAL_TEMPERATURE, verbose=False)
+                    # 不允许回退到 HF：验证阶段 vLLM 不可用即报错
+                    raise RuntimeError(f"[VAL] {_name}: vLLM not available for validation (no fallback).")
 
                 def _extract_completions(gen_out):
                     # 兼容 generate 返回 (completions, indices, masks, log_probs) 的情况
@@ -729,7 +777,7 @@ def main():
     training_done = False
     decode_buffer: List[dict] = [] if not is_multi_model_mode else None
     mm_decode_buffer: List[dict] = [] if is_multi_model_mode else None
-    rollout_batch_size = max(1, getattr(args, "rollout_batch_size", 64))
+    rollout_batch_size = max(1, getattr(args, "rollout_batch_size", 128))
     # Global reward executor for training-time reward computation
     train_reward_executor = ProcessPoolExecutor(
         max_workers=max(1, num_models), mp_context=mp.get_context("spawn")
@@ -1015,11 +1063,11 @@ def main():
                                 for ep in own_pos:
                                     group.append(
                                         {
-                                            "prefix_token_ids": ep["prefix_token_ids"],
-                                            "generated_token_ids": ep["generated_token_ids"],
-                                            "reward": ep["reward"],
+                            "prefix_token_ids": ep["prefix_token_ids"], 
+                            "generated_token_ids": ep["generated_token_ids"],
+                            "reward": ep["reward"],
                                             "completion": ep.get("completion"),
-                                            "old_log_probs": ep.get("old_log_probs"),
+                            "old_log_probs": ep.get("old_log_probs"),
                                         }
                                     )
 
@@ -1105,7 +1153,14 @@ def main():
                                 print(f"[TRAIN] {name}: vLLM LoRA sync failed; consider disabling vLLM for training rollout.")
                     except Exception as _se:
                         print(f"[TRAIN] {name}: LoRA sync error: {_se}")
-                    engine_label = "vLLM" if getattr(model, "use_vllm", False) and getattr(model, "vllm_engine", None) is not None else "HF"
+                    use_vllm_now = (
+                        getattr(model, "use_vllm", False)
+                        and (
+                            getattr(model, "vllm_engine", None) is not None
+                            or getattr(model, "vllm_worker", None) is not None
+                        )
+                    )
+                    engine_label = "vLLM" if use_vllm_now else "HF"
                     print(f"  {name} ({device}): Decoding {len(prompts)} prompts with {engine_label}...")
                     # Decode in chunks to avoid OOM (cap per-call prompts)
                     decode_chunk_size = min(len(prompts), 256)
@@ -1120,7 +1175,8 @@ def main():
                             limitation=MAX_GEN_LEN,
                             temperature=TRAIN_TEMPERATURE,
                             verbose=True,
-                            return_log_probs=bool(getattr(model, "use_vllm", False)),
+                            # OpenRLHF-style: vLLM 仅用于生成，旧策略对数概率由 HF/Actor 计算
+                            return_log_probs=False,
                         )
                         for j, result in enumerate(completions):
                             sample = chunk_refs[j]
@@ -1392,6 +1448,19 @@ def main():
                                 f"Clip ratio: {update_result['clip_ratio']:.4f}"
                             )
 
+                            # Print diagnostics (old_log_probs coverage, ratio stats, |A| mean)
+                            _m = update_result.get("metrics") or {}
+                            try:
+                                _cov = float(_m.get("old_lp_cov", 0.0))
+                                _rmu = float(_m.get("ratio_mean", 0.0))
+                                _rsd = float(_m.get("ratio_std", 0.0))
+                                _aam = float(_m.get("adv_abs_mean", 0.0))
+                                print(
+                                    f"      diag: old_lp_cov={_cov:.3f}, ratio_mean={_rmu:.3f}, ratio_std={_rsd:.3f}, adv_abs_mean={_aam:.3f}"
+                                )
+                            except Exception:
+                                pass
+
                     if _WANDB_AVAILABLE:
                         try:
                             wandb.log({
@@ -1408,7 +1477,7 @@ def main():
                     # Hot-update vLLM weights without engine restart (dense/FacT)
                     # Do this in main thread to avoid engine races with vLLM
                     model = models[model_idx]
-                    if getattr(args, "use_vllm", False):
+                    if getattr(args, "use_vllm", False) and getattr(model, "lora_config", None) is None:
                         ok = False
                         if hasattr(model, "hot_update_vllm_full_weights"):
                             ok = bool(model.hot_update_vllm_full_weights())

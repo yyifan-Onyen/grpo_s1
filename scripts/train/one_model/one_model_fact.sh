@@ -3,8 +3,12 @@
 # GRPO训练脚本 - 三个模型独立训练
 
 echo "=== GRPO Three Models Independent Training ==="
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export VLLM_USE_V1=0
 PYTHON=${PYTHON:-python3}
+
+export TOKENIZERS_PARALLELISM=true
+
+export TORCH_SHOW_CPP_STACKTRACES=1 VLLM_LOGGING_LEVEL=DEBUG
 
 # 创建必要的目录
 mkdir -p logs checkpoints
@@ -12,14 +16,13 @@ mkdir -p checkpoints/qwen_fact checkpoints/phi_fact checkpoints/llama_fact
 
 # Qwen模型训练（FacT 适配器）
 echo "Training Qwen with FacT finetuning..."
-# 使用单卡进行训练（HF）
 CUDA_VISIBLE_DEVICES=6,7 ${PYTHON} train_new.py \
   --models "Qwen/Qwen2.5-3B-Instruct" \
   --adapter fact \
   --dtype bfloat16 \
   --lr 1e-5 \
   --epochs 1 \
-  --batch-size 64 \
+  --batch-size 128 \
   --num-answers 8 \
   --task-type math \
   --data-root "/workspace/data" \
@@ -29,11 +32,12 @@ CUDA_VISIBLE_DEVICES=6,7 ${PYTHON} train_new.py \
   --no-ref-model \
   --use-vllm \
   --vllm-gpu 1 \
-  --vllm-gpu-mem 0.3 \
+  --vllm-gpu-mem 0.6 \
   --vllm-max-model-len 32768 \
   --ppo-epochs 1 \
   --loss-aggregation token-mean \
   --advantage-clip 2.0 \
+  --val-interval 4 \
   --rollout-batch-size 128 \
   --run-name "GRPO_Qwen2.5-3B-Instruct_fact_$(date +%Y%m%d_%H%M%S)" \
   > logs/qwen_fact.log 2>&1 &

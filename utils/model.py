@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Any
 import torch
 import json
 import os
@@ -34,6 +34,41 @@ except Exception:
     VLLMSamplingParams = None
     VLLMLoRARequest = None
     _VLLM_AVAILABLE = False
+
+if _VLLM_AVAILABLE:
+    try:
+        from .vllm_worker import VLLMWorkerProxy  # type: ignore
+    except Exception:
+        VLLMWorkerProxy = None  # type: ignore
+else:  # pragma: no cover
+    VLLMWorkerProxy = None  # type: ignore
+
+
+def _normalise_logprobs(raw: Optional[List[Any]], token_ids: List[int]) -> Optional[List[Optional[float]]]:
+    """Convert heterogeneous logprob payloads to python floats (None -> NaN)."""
+    if raw is None:
+        return None
+    normalised: List[Optional[float]] = []
+    for idx, tk in enumerate(raw):
+        if tk is None:
+            normalised.append(None)
+            continue
+        try:
+            if hasattr(tk, "logprob"):
+                normalised.append(float(tk.logprob))
+            elif isinstance(tk, dict) and idx < len(token_ids):
+                chosen = token_ids[idx]
+                if chosen in tk:
+                    normalised.append(float(tk[chosen]))
+                elif tk:
+                    normalised.append(float(max(tk.values())))
+                else:
+                    normalised.append(None)
+            else:
+                normalised.append(None)
+        except Exception:
+            normalised.append(None)
+    return normalised
 
 
 class LanguageModel(object):
@@ -176,82 +211,72 @@ class LanguageModel(object):
         # vLLM target GPU local index (within CUDA_VISIBLE_DEVICES) or absolute id if not set
         self.vllm_target_gpu = vllm_gpu_id
         self.vllm_engine = None
+        self.vllm_worker: Optional[VLLMWorkerProxy] = None
+        if self.use_vllm and not _VLLM_AVAILABLE:
+            self.use_vllm = False
         if self.use_vllm:
             try:
-                # Select target GPU for vLLM engine by scoping CUDA_VISIBLE_DEVICES to only that GPU
-                prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-                target_cvd = None
-                if vllm_gpu_memory_utilization is not None or True:
-                    pass  # placeholder to keep logical block aligned
-                # try map vllm gpu id if provided via kwargs
-                vllm_gpu_id = locals().get("vllm_gpu_id", None)
-                # locals() may not include it reliably; instead, rely on function arg name
-                # We explicitly captured via parameter name above; so we can use it directly
-                try:
-                    _vllm_gpu_id = vllm_gpu_memory_utilization  # dummy to silence lints (no-op)
-                except Exception:
-                    pass
-                # Proper mapping using parameter value
-                # Note: we intentionally refer to the function parameter 'vllm_gpu_memory_utilization' above, not id
-                # Here we recompute from closure: use_vllm, vllm_gpu_memory_utilization already used; now find id from 'vllm_gpu_id'
-                # Since Python doesn't allow shadowing easily in this diff, we reconstruct from self attributes if set later
-                
+                visible_cuda = self._resolve_vllm_visible_device(self.vllm_target_gpu)
                 if torch_dtype == torch.bfloat16:
-                    _dtype = "bfloat16"
+                    dtype_str = "bfloat16"
                 elif torch_dtype == torch.float16:
-                    _dtype = "float16"
+                    dtype_str = "float16"
                 elif torch_dtype == torch.float32:
-                    _dtype = "float32"
+                    dtype_str = "float32"
                 else:
-                    _dtype = "auto"
-                _gpu_util = 0.6 if vllm_gpu_memory_utilization is None else float(vllm_gpu_memory_utilization)
-                # Map GPU for vLLM by local index within current visible devices if 'self.vllm_target_gpu' exists
-                target_gpu_index = getattr(self, "vllm_target_gpu", None)
-                try:
-                    if target_gpu_index is not None:
-                        cur_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-                        if cur_cvd:
-                            lst = [p.strip() for p in cur_cvd.split(",") if p.strip()]
-                            if 0 <= int(target_gpu_index) < len(lst):
-                                target_cvd = lst[int(target_gpu_index)]
-                            else:
-                                target_cvd = str(target_gpu_index)
-                        else:
-                            target_cvd = str(target_gpu_index)
-                        os.environ["CUDA_VISIBLE_DEVICES"] = target_cvd
-                except Exception:
-                    target_cvd = None
-                try:
-                    # Try both max_seq_len and max_model_len for compatibility across vLLM versions
-                    _kwargs = dict(
-                        model=model_path,
-                        dtype=_dtype,
-                        tensor_parallel_size=1,
-                        trust_remote_code=True,
-                        gpu_memory_utilization=_gpu_util,
-                        enable_lora=True,
-                        enforce_eager=True,  # disable CUDA graph to avoid illegal memory access issues
-                    )
-                    if vllm_max_model_len is not None:
-                        try:
-                            self.vllm_engine = VLLMEngine(**_kwargs, max_seq_len=int(vllm_max_model_len))
-                        except TypeError:
-                            self.vllm_engine = VLLMEngine(**_kwargs, max_model_len=int(vllm_max_model_len))
-                    else:
-                        self.vllm_engine = VLLMEngine(**_kwargs)
-                finally:
-                    # restore original visibility
+                    dtype_str = "auto"
+                gpu_util = 0.6 if vllm_gpu_memory_utilization is None else float(vllm_gpu_memory_utilization)
+                if VLLMWorkerProxy is not None:
+                    try:
+                        self.vllm_worker = VLLMWorkerProxy(
+                            model_path=model_path,
+                            dtype=dtype_str,
+                            visible_cuda=visible_cuda,
+                            gpu_memory_utilization=gpu_util,
+                            max_model_len=vllm_max_model_len,
+                            enable_lora=True,
+                            enforce_eager=True,
+                        )
+                        print(
+                            f"[vLLM] worker enabled for {model_path} on "
+                            f"CUDA_VISIBLE_DEVICES={self.vllm_worker.visible_cuda or 'auto'}"
+                        )
+                    except Exception as _e:
+                        print(f"[vLLM] worker init failed for {model_path}: {_e}. Trying inline engine.")
+                        self.vllm_worker = None
+                if self.vllm_worker is None:
+                    prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+                    target_cvd = visible_cuda
                     if target_cvd is not None:
-                        if prev_cvd is None:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = target_cvd
+                    try:
+                        kwargs = dict(
+                            model=model_path,
+                            dtype=dtype_str,
+                            tensor_parallel_size=1,
+                            trust_remote_code=True,
+                            gpu_memory_utilization=gpu_util,
+                            enable_lora=True,
+                            enforce_eager=True,  # disable CUDA graph to avoid illegal memory access issues
+                        )
+                        if vllm_max_model_len is not None:
                             try:
-                                del os.environ["CUDA_VISIBLE_DEVICES"]
-                            except Exception:
-                                pass
+                                self.vllm_engine = VLLMEngine(**kwargs, max_seq_len=int(vllm_max_model_len))
+                            except TypeError:
+                                self.vllm_engine = VLLMEngine(**kwargs, max_model_len=int(vllm_max_model_len))
                         else:
-                            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
-                print(f"vLLM engine enabled for {model_path}")
+                            self.vllm_engine = VLLMEngine(**kwargs)
+                        print(f"vLLM engine enabled for {model_path}")
+                    finally:
+                        if target_cvd is not None:
+                            if prev_cvd is None:
+                                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                            else:
+                                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
             except Exception as _e:
                 print(f"[vLLM] init failed for {model_path}: {_e}. Fallback to HF generate.")
+                self.vllm_worker = None
+                self.vllm_engine = None
                 self.use_vllm = False
 
         # vLLM LoRA state
@@ -263,6 +288,21 @@ class LanguageModel(object):
 
         # 不再尝试接入 VERL SPMD rollout
         self.verl_rollout = None
+
+    def _resolve_vllm_visible_device(self, target_index: Optional[int]) -> Optional[str]:
+        """Map local GPU index to physical CUDA id for worker binding."""
+        if target_index is None:
+            return None
+        try:
+            cur_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if cur_cvd:
+                devices = [p.strip() for p in cur_cvd.split(",") if p.strip()]
+                if 0 <= int(target_index) < len(devices):
+                    return devices[int(target_index)]
+                return str(target_index)
+            return str(target_index)
+        except Exception:
+            return str(target_index)
 
     def export_fact_merged(self, path: str) -> str:
         """Export a dense model with FacT merged into Linear weights.
@@ -383,6 +423,21 @@ class LanguageModel(object):
         if self.fact_config is None:
             print("[FacT] No FacT adapters present; refresh_vllm_merged_engine skipped.")
             return False
+        if self.vllm_worker is not None:
+            tmp_root = tempfile.mkdtemp(prefix="fact_merged_vllm_")
+            merged_dir = os.path.join(tmp_root, "merged")
+            try:
+                self.export_fact_merged(merged_dir)
+                self.vllm_worker.load_weights(merged_dir)
+                if self._fact_last_merged_dir and os.path.isdir(self._fact_last_merged_dir):
+                    shutil.rmtree(self._fact_last_merged_dir, ignore_errors=True)
+                self._fact_last_merged_dir = tmp_root
+                print("[vLLM] Worker merged FacT weights are ready for rollout.")
+                return True
+            except Exception as _e:
+                print(f"[vLLM] worker failed to load merged FacT weights: {_e}")
+                shutil.rmtree(tmp_root, ignore_errors=True)
+                return False
         # Export merged model to a temp dir
         tmp_root = tempfile.mkdtemp(prefix="fact_merged_vllm_")
         merged_dir = os.path.join(tmp_root, "merged")
@@ -501,7 +556,7 @@ class LanguageModel(object):
         return_log_probs: bool = False,
     ) -> Union[List[str], Tuple[List[str], torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]]]]:
         """Generate text completions using vLLM only (no HF fallback)."""
-        if not (self.use_vllm and self.vllm_engine is not None):
+        if not self.use_vllm or (self.vllm_worker is None and self.vllm_engine is None):
             raise RuntimeError(
                 "vLLM engine is not available. Enable use_vllm or build a merged engine (FacT)."
             )
@@ -513,58 +568,101 @@ class LanguageModel(object):
                 add_generation_prompt=True
             ))
 
-        # vLLM SamplingParams(logprobs=k) returns top-k logprobs per token; set k=1 to get chosen-token logprob
-        try:
-            sampling = VLLMSamplingParams(
-                temperature=float(temperature),
-                max_tokens=int(limitation),
-                n=1,
-                logprobs=1 if return_log_probs else None,
+        sampling_kwargs: Dict[str, Any] = {
+            "temperature": float(temperature),
+            "max_tokens": int(limitation),
+            "n": 1,
+        }
+        if return_log_probs:
+            sampling_kwargs["logprobs"] = 1
+
+        worker_payload: Optional[List[Dict[str, Any]]] = None
+        worker_use_lora = (
+            self.vllm_worker is not None
+            and isinstance(self.vllm_lora_adapter_name, str)
+            and isinstance(self.vllm_lora_adapter_path, str)
+        )
+
+        if self.vllm_worker is not None:
+            worker_payload = self.vllm_worker.generate(
+                conversations=conversations,
+                sampling=sampling_kwargs,
+                use_lora=worker_use_lora,
             )
-        except TypeError:
-            # Fallback for older signatures without logprobs
-            sampling = VLLMSamplingParams(
-                temperature=float(temperature),
-                max_tokens=int(limitation),
-                n=1,
-            )
-        # Attach LoRA request if we have prepared adapter for vLLM
-        lora_kwargs = {}
-        if (
-            VLLMLoRARequest is not None and
-            isinstance(self.vllm_lora_adapter_name, str) and
-            isinstance(self.vllm_lora_adapter_path, str)
-        ):
+            completions = [item.get("text", "") for item in worker_payload]
+        else:
+            lora_kwargs: Dict[str, Any] = {}
+            if (
+                VLLMLoRARequest is not None
+                and isinstance(self.vllm_lora_adapter_name, str)
+                and isinstance(self.vllm_lora_adapter_path, str)
+            ):
+                try:
+                    lora_kwargs["lora_request"] = VLLMLoRARequest(
+                        lora_name=self.vllm_lora_adapter_name,
+                        lora_int_id=abs(hash(self.vllm_lora_adapter_name)) % (10**9),
+                        lora_path=self.vllm_lora_adapter_path,
+                    )
+                except Exception:
+                    pass
+            if VLLMSamplingParams is None:
+                raise RuntimeError("VLLM sampling parameters unavailable for inline engine.")
             try:
-                lora_kwargs["lora_request"] = VLLMLoRARequest(
-                    lora_name=self.vllm_lora_adapter_name,
-                    lora_int_id=abs(hash(self.vllm_lora_adapter_name)) % (10**9),
-                    lora_path=self.vllm_lora_adapter_path,
-                )
-            except Exception:
-                pass
-        with torch.no_grad():
-            try:
-                outputs = self.vllm_engine.generate(conversations, sampling, **lora_kwargs)
+                sampling = VLLMSamplingParams(**sampling_kwargs)
             except TypeError:
-                # Older vLLM without lora_request in generate; fall back to no-arg call (adapter may be set globally)
-                outputs = self.vllm_engine.generate(conversations, sampling)
-        completions = [o.outputs[0].text for o in outputs]
+                sampling_kwargs.pop("logprobs", None)
+                sampling = VLLMSamplingParams(**sampling_kwargs)
+            with torch.no_grad():
+                try:
+                    outputs = self.vllm_engine.generate(conversations, sampling, **lora_kwargs)
+                except TypeError:
+                    outputs = self.vllm_engine.generate(conversations, sampling)
+            worker_payload = []
+            for out in outputs:
+                slot = out.outputs[0]
+                token_ids = list(slot.token_ids)
+                worker_payload.append(
+                    {
+                        "text": slot.text,
+                        "token_ids": token_ids,
+                        "logprobs": _normalise_logprobs(slot.logprobs, token_ids),
+                    }
+                )
+            completions = [entry["text"] for entry in worker_payload]
+        if worker_payload is None:
+            worker_payload = []
         # Prefer token ids from vLLM if available to avoid retokenization mismatch
         # Batch-tokenize conversation prefixes to reduce per-item overhead
         try:
-            _prefix_tok = self.tokenizer(conversations, add_special_tokens=False, return_tensors=None)
-            if isinstance(_prefix_tok, dict) and "input_ids" in _prefix_tok:
+            _prefix_tok = self.tokenizer(
+                conversations,
+                add_special_tokens=False,
+                return_tensors=None,
+            )
+            # Accept BatchEncoding or dict-like; only check for key presence
+            if _prefix_tok is not None and ("input_ids" in _prefix_tok):
                 prefix_ids_list = _prefix_tok["input_ids"]
+                # Normalize container to a Python list (handles tensors/ndarrays)
                 if hasattr(prefix_ids_list, "tolist"):
-                    # torch / numpy tensor -> list
                     prefix_ids_list = prefix_ids_list.tolist()
-                elif isinstance(prefix_ids_list, list):
-                    # already a python list-of-lists; keep as-is
-                    pass
                 else:
-                    # unknown structure
-                    prefix_ids_list = []
+                    try:
+                        prefix_ids_list = list(prefix_ids_list)
+                    except Exception:
+                        prefix_ids_list = []
+                # Ensure each row is a plain list of ints
+                _norm = []
+                for row in prefix_ids_list:
+                    if hasattr(row, "tolist"):
+                        _norm.append(row.tolist())
+                    elif isinstance(row, list):
+                        _norm.append(row)
+                    else:
+                        try:
+                            _norm.append(list(row))
+                        except Exception:
+                            _norm.append([])
+                prefix_ids_list = _norm
             else:
                 prefix_ids_list = []
         except Exception:
@@ -584,41 +682,38 @@ class LanguageModel(object):
                 except Exception:
                     ids = []
                 prefix_ids_list.append(ids)
-        gen_ids_list = []
+        gen_ids_list: List[List[int]] = []
         vllm_log_probs_list: Optional[List[torch.Tensor]] = [] if return_log_probs else None
-        for conv, out in zip(conversations, outputs):
-            try:
-                gen_token_ids = out.outputs[0].token_ids
-            except Exception:
-                # Fallback: retokenize completion text
-                gen_token_ids = self.tokenizer(out.outputs[0].text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
-            gen_ids_list.append(gen_token_ids)
-            if return_log_probs:
+        for conv, payload in zip(conversations, worker_payload):
+            token_ids = payload.get("token_ids") if isinstance(payload, dict) else None
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            elif isinstance(token_ids, tuple):
+                token_ids = list(token_ids)
+            elif not isinstance(token_ids, list):
+                text = ""
+                if isinstance(payload, dict):
+                    text = payload.get("text", "")
                 try:
-                    # vLLM returns per-token logprobs for generated tokens if requested
-                    token_logprobs = []
-                    for tk in out.outputs[0].logprobs:
-                        # logprobs is a list per token; take the chosen token's logprob if present
-                        if tk is None:
-                            token_logprobs.append(float("nan"))
-                        else:
-                            # tk could be a dict mapping token->logprob or a structure with .logprob
-                            if hasattr(tk, 'logprob'):
-                                token_logprobs.append(float(tk.logprob))
-                            elif isinstance(tk, dict):
-                                # find the token id we chose
-                                chosen_id = gen_token_ids[len(token_logprobs)] if len(gen_token_ids) > len(token_logprobs) else None
-                                if chosen_id is not None and chosen_id in tk:
-                                    token_logprobs.append(float(tk[chosen_id]))
-                                else:
-                                    # take max
-                                    token_logprobs.append(float(max(tk.values())))
-                            else:
-                                # Unknown structure; skip
-                                token_logprobs.append(float("nan"))
-                    vllm_log_probs_list.append(torch.tensor(token_logprobs, dtype=torch.float32, device=self.device))
+                    token_ids = self.tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
                 except Exception:
-                    vllm_log_probs_list.append(None)  # type: ignore
+                    token_ids = []
+            else:
+                token_ids = list(token_ids)
+            gen_ids_list.append(token_ids)
+            if return_log_probs:
+                log_probs = None
+                if isinstance(payload, dict):
+                    log_probs = payload.get("logprobs")
+                if log_probs is None:
+                    vllm_log_probs_list.append(None)  # type: ignore[arg-type]
+                else:
+                    tensor_vals = [
+                        float("nan") if lp is None else float(lp) for lp in log_probs  # type: ignore[arg-type]
+                    ]
+                    vllm_log_probs_list.append(
+                        torch.tensor(tensor_vals, dtype=torch.float32, device=self.device)
+                    )
         if not prefix_ids_list or not gen_ids_list:
             max_len = 0
         else:
@@ -627,6 +722,18 @@ class LanguageModel(object):
         indices_list = []
         masks_list = []
         for p_ids, g_ids in zip(prefix_ids_list, gen_ids_list):
+            # Ensure both sides are python lists before concatenation to avoid
+            # TypeError when g_ids may be a tuple/array-like from vLLM outputs.
+            if not isinstance(p_ids, list):
+                try:
+                    p_ids = list(p_ids)
+                except Exception:
+                    p_ids = []
+            if not isinstance(g_ids, list):
+                try:
+                    g_ids = list(g_ids)
+                except Exception:
+                    g_ids = []
             seq = p_ids + g_ids
             pad_len = max_len - len(seq)
             indices_list.append(seq + [pad_id] * max(pad_len, 0))
@@ -644,14 +751,14 @@ class LanguageModel(object):
         else:
             return completions
 
-    # 已移除 VERL SPMD 生成路径
+
 
     def sync_lora_to_vllm(self, adapter_name: str = "peft") -> bool:
         """Export current PEFT LoRA adapter and load it into vLLM engine.
 
         Returns True if successfully loaded; False otherwise.
         """
-        if not (self.use_vllm and self.vllm_engine is not None):
+        if not self.use_vllm or (self.vllm_worker is None and self.vllm_engine is None):
             return False
         if self.lora_config is None:
             # No LoRA applied on HF model
@@ -672,17 +779,45 @@ class LanguageModel(object):
         # Record adapter info for per-request LoRA injection
         self.vllm_lora_adapter_name = adapter_name
         self.vllm_lora_adapter_path = adapter_dir
-        self.vllm_lora_loaded = VLLMLoRARequest is not None
+        self.vllm_lora_loaded = True
         print(f"[vLLM/LoRA] Prepared adapter '{adapter_name}' at {adapter_dir}")
-        # Best-effort engine-level load for older vLLM; optional
-        try:
-            if hasattr(self.vllm_engine, "load_lora_adapter"):
-                self.vllm_engine.load_lora_adapter(adapter_name, adapter_dir)  # type: ignore
-                print("[vLLM/LoRA] Also loaded adapter into engine via load_lora_adapter")
-        except Exception as _e:
-            print(f"[vLLM/LoRA] Engine-level load (optional) failed: {_e}")
+        if self.vllm_worker is not None:
+            try:
+                self.vllm_worker.set_lora_adapter(adapter_name, adapter_dir, load_into_engine=True)
+            except Exception as _e:
+                print(f"[vLLM/LoRA] Worker-level load failed: {_e}")
+        elif self.vllm_engine is not None:
+            try:
+                if hasattr(self.vllm_engine, "load_lora_adapter"):
+                    self.vllm_engine.load_lora_adapter(adapter_name, adapter_dir)  # type: ignore
+                    print("[vLLM/LoRA] Also loaded adapter into engine via load_lora_adapter")
+            except Exception as _e:
+                print(f"[vLLM/LoRA] Engine-level load (optional) failed: {_e}")
         return True
 
+
+    def shutdown_vllm(self) -> None:
+        """Stop worker or inline vLLM engine if running."""
+        if self.vllm_worker is not None:
+            try:
+                self.vllm_worker.shutdown()
+            except Exception:
+                pass
+            self.vllm_worker = None
+        if self.vllm_engine is not None:
+            try:
+                shutdown = getattr(self.vllm_engine, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            except Exception:
+                pass
+            self.vllm_engine = None
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown_vllm()
+        except Exception:
+            pass
 
     def save(self, path: str) -> None:
         """Save checkpoint.
@@ -842,12 +977,71 @@ class LanguageModel(object):
     def hot_update_vllm_full_weights(self) -> bool:
         """Hot update vLLM weights in-place (no engine restart).
 
-        - Dense: stream HF state_dict tensors.
-        - FacT: on-the-fly merge FacT-wrapped Linear to effective dense weights, skip fact_*.
+        - Dense/FacT: stream tensors per-parameter to worker via update_weights (OpenRLHF-style).
 
         Only recommended when tensor_parallel_size == 1 and engine colocates in the same process.
         Returns True if successfully dispatched to vLLM.
         """
+
+        if self.vllm_worker is not None:
+            # Build (name, tensor) pairs. For FacT, merge on the fly for target Linear, skip fact_*.
+            sd = self.model.state_dict()
+            weights: List[Tuple[str, torch.Tensor]] = []
+
+            # Collect FacT merged weights first if FacT is enabled
+            fact_wrapped: Dict[str, SharedFacTLinear] = {}
+            if self.fact_config is not None:
+                for name, module in self.model.named_modules():
+                    if isinstance(module, SharedFacTLinear):
+                        fact_wrapped[name] = module
+
+            visited: set[str] = set()
+
+            # 1) Emit merged weights for FacT-wrapped Linear modules
+            for mname, mod in fact_wrapped.items():
+                original = mod.original_layer
+                W_orig = original.weight.detach()
+                device = W_orig.device
+                dtype = W_orig.dtype
+                U = mod.fact_u.weight.detach().to(device=device, dtype=dtype)
+                T = mod.fact_t.weight.detach().to(device=device, dtype=dtype)
+                V = mod.fact_v.weight.detach().to(device=device, dtype=dtype)
+                scaling = float(mod.scale) * (float(mod.alpha) / max(1.0, float(mod.rank)))
+                W_add = (V @ T @ U) * scaling
+                W_eff = W_orig + W_add
+                weight_key = f"{mname}.weight"
+                weights.append((weight_key, W_eff))
+                visited.add(weight_key)
+                if original.bias is not None:
+                    bias_key = f"{mname}.bias"
+                    weights.append((bias_key, original.bias.detach()))
+                    visited.add(bias_key)
+
+            # 2) Emit the rest tensors (skip FacT internals and original_layer.*)
+            for k, v in sd.items():
+                if ".fact_" in k or ".original_layer." in k:
+                    continue
+                if k in visited:
+                    continue
+                weights.append((k, v.detach()))
+
+            try:
+                # Send to worker for in-place load
+                # Large lists: chunk to avoid IPC payload limits
+                CHUNK = 2048
+                for i in range(0, len(weights), CHUNK):
+                    chunk = weights[i:i+CHUNK]
+                    # worker will cpu().contiguous() itself; we keep device tensors here
+                    self.vllm_worker._request({"op": "update_weights", "weights": chunk})
+                # Reset prefix cache if any lingering state
+                try:
+                    self.vllm_worker._request({"op": "reset_prefix_cache"})  # optional, ignore if unknown
+                except Exception:
+                    pass
+                return True
+            except Exception as exc:
+                print(f"[vLLM] worker hot update failed: {exc}")
+                return False
 
         internal_model = self._get_vllm_internal_model()
         if internal_model is None:

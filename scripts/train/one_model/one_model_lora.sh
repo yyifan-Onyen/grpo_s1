@@ -3,11 +3,14 @@
 # GRPO训练脚本 - 三个模型独立训练
 
 echo "=== GRPO Three Models Independent Training ==="
+export VLLM_USE_V1=0
+PYTHON=${PYTHON:-python3}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
+export TOKENIZERS_PARALLELISM=true
+export TORCH_SHOW_CPP_STACKTRACES=1 VLLM_LOGGING_LEVEL=DEBUG
 # 创建必要的目录
 mkdir -p logs checkpoints
-mkdir -p checkpoints/qwen_lora checkpoints/phi_lora checkpoints/llama_lora
+mkdir -p checkpoints/qwen_lora checkpoints/phi_lora checkpoints/smollm3_lora
 
 # Qwen模型训练（lora微调）
 echo "Training Qwen with LoRA finetuning..."
@@ -16,7 +19,7 @@ CUDA_VISIBLE_DEVICES=6,7 python train_new.py \
   --models "Qwen/Qwen2.5-3B-Instruct" \
   --adapter lora \
   --dtype bfloat16 \
-  --lr 1e-5 \
+  --lr 5e-6 \
   --epochs 1 \
   --batch-size 128 \
   --num-answers 8 \
@@ -25,10 +28,13 @@ CUDA_VISIBLE_DEVICES=6,7 python train_new.py \
   --max-steps 100 \
   --ckpt-dir "/workspace/checkpoints/qwen_lora" \
   --ckpt-interval 0 \
+  --val-interval 20 \
   --use-ref-model \
-  --ppo-epochs 2 \
+  --ppo-epochs 1 \
+  --beta 0.2 \
+  --lr 5e-6 \
   --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
+  --advantage-clip 0.6 \
   --use-vllm --vllm-gpu 1 --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 \
   --rollout-batch-size 128 \
   --run-name "GRPO_Qwen2.5-3B-Instruct_lora_$(date +%Y%m%d_%H%M%S)" \
@@ -62,10 +68,11 @@ QWEN_PID=$!
 
 # PHI_PID=$!
 
+
 # Llama模型训练（lora微调）
-echo "Training Llama with LoRA finetuning..."
+echo "Training SmolLM3-3B-Instruct with LoRA finetuning..."
 CUDA_VISIBLE_DEVICES=5,4 python train_new.py \
-  --models "meta-llama/Llama-3.2-3B-Instruct" \
+  --models "HuggingFaceTB/SmolLM3-3B" \
   --adapter lora \
   --dtype bfloat16 \
   --lr 1e-5 \
@@ -75,24 +82,56 @@ CUDA_VISIBLE_DEVICES=5,4 python train_new.py \
   --task-type math \
   --data-root "/workspace/data" \
   --max-steps 100 \
-  --ckpt-dir "/workspace/checkpoints/llama_lora" \
+  --ckpt-dir "/workspace/checkpoints/smollm3_lora" \
   --ckpt-interval 0 \
+  --val-interval 20 \
   --use-ref-model \
-  --ppo-epochs 2 \
+  --ppo-epochs 1 \
+  --beta 0.2 \
+  --lr 5e-6 \
   --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
+  --advantage-clip 0.6 \
   --use-vllm --vllm-gpu 1 --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 \
   --rollout-batch-size 128 \
-  --run-name "GRPO_Llama-3.2-3B-Instruct_lora_$(date +%Y%m%d_%H%M%S)" \
-  > logs/llama_lora.log 2>&1 &
+  --run-name "GRPO_SmolLM3-3B_lora_$(date +%Y%m%d_%H%M%S)" \
+  > logs/smollm3_lora.log 2>&1 &
 
-LLAMA_PID=$!
+SMOLLM3_PID=$!
+
+# # Llama模型训练（lora微调）
+# echo "Training Llama with LoRA finetuning..."
+# CUDA_VISIBLE_DEVICES=5,4 python train_new.py \
+#   --models "meta-llama/Llama-3.2-3B-Instruct" \
+#   --adapter lora \
+#   --dtype bfloat16 \
+#   --lr 1e-5 \
+#   --epochs 1 \
+#   --batch-size 128 \
+#   --num-answers 8 \
+#   --task-type math \
+#   --data-root "/workspace/data" \
+#   --max-steps 500 \
+#   --ckpt-dir "/workspace/checkpoints/llama_lora" \
+#   --ckpt-interval 0 \
+#   --val-interval 50 \
+#   --use-ref-model \
+#   --ppo-epochs 1 \
+#   --beta 0.2 \
+#   --lr 5e-6 \
+#   --loss-aggregation token-mean \
+#   --advantage-clip 2.0 \
+#   --use-vllm --vllm-gpu 1 --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 \
+#   --rollout-batch-size 128 \
+#   --run-name "GRPO_Llama-3.2-3B-Instruct_lora_$(date +%Y%m%d_%H%M%S)" \
+#   > logs/llama_lora.log 2>&1 &
+
+# LLAMA_PID=$!
 
 echo "All training started in parallel!"
-echo "PIDs: Qwen=$QWEN_PID, Phi=$PHI_PID, Llama=$LLAMA_PID"
+echo "PIDs: Qwen=$QWEN_PID, SmolLM3=$SMOLLM3_PID"
 echo "Check logs: tail -f logs/qwen_lora.log"
 # echo "Check logs: tail -f logs/phi_lora.log" 
-echo "Check logs: tail -f logs/llama_lora.log"
+echo "Check logs: tail -f logs/smollm3_lora.log"
 
 # 等待所有任务完成
 wait $QWEN_PID
@@ -101,7 +140,7 @@ echo "Qwen training completed!"
 # wait $PHI_PID
 # echo "Phi training completed!"
 
-wait $LLAMA_PID
-echo "Llama training completed!"
+wait $SMOLLM3_PID
+echo "SmolLM3 training completed!"
 
 echo "All parallel training completed!"

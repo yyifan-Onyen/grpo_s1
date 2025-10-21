@@ -125,8 +125,9 @@ def get_log_probs(model, input_ids, target_ids, target_masks, pad_token_id, voca
     
     safe_pad_token_id = pad_token_id if pad_token_id < vocab_size else 0
     
+    # Compute CE in fp32 for numerical stability (bf16 can amplify errors in softmax/log)
     log_probs = -F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
+        logits.float().reshape(-1, logits.size(-1)),
         target_ids.reshape(-1),
         ignore_index=safe_pad_token_id,
         reduction="none",
@@ -141,8 +142,9 @@ def get_log_probs(model, input_ids, target_ids, target_masks, pad_token_id, voca
 
 
 def compute_kl_divergence(current_log_probs, ref_log_probs, target_masks):
-    delta = ref_log_probs - current_log_probs
-    per_token_kl = torch.exp(delta) - delta - 1.0
+    log_ratio = current_log_probs - ref_log_probs
+    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+    per_token_kl = torch.exp(log_ratio) - 1.0 - log_ratio
     return per_token_kl
 
 
@@ -210,6 +212,15 @@ def update_policy(
     token_loss_den = 0.0
     episode_loss_accum = 0.0
     episode_loss_den = 0.0
+
+    # Diagnostics accumulators
+    oldlp_cov_num = 0.0
+    oldlp_cov_den = 0.0
+    ratio_sum = 0.0
+    ratio_sq_sum = 0.0
+    ratio_den = 0.0
+    adv_abs_sum = 0.0
+    adv_abs_den = 0.0
 
     if ppo_mini_batch_size and ppo_mini_batch_size > 0:
         mini_batch_size = min(ppo_mini_batch_size, total_episode_count)
@@ -389,6 +400,18 @@ def update_policy(
                         clip_ratio_num += (is_clipped * target_masks).sum()
                         clip_ratio_den += target_masks.sum()
 
+                        # Diagnostics: advantages (episode level), ratio stats, old_log_prob coverage
+                        adv_abs_sum += batch_advantages.abs().sum().item()
+                        adv_abs_den += batch_advantages.numel()
+
+                        ratio_sum += (ratio * target_masks).sum().item()
+                        ratio_sq_sum += ((ratio ** 2) * target_masks).sum().item()
+                        ratio_den += float(target_masks.sum().item())
+
+                        provided_mask = (old_log_probs_tensor - current_log_probs).abs() > 1e-9
+                        oldlp_cov_num += float((provided_mask * target_masks).sum().item())
+                        oldlp_cov_den += float(target_masks.sum().item())
+
                     # Do not cache current_log_probs across steps to avoid shape mismatch
 
                     # cleanup micro-batch
@@ -414,6 +437,13 @@ def update_policy(
 
     # 训练末尾不强制清空缓存，交由分配器自行管理
 
+    # Diagnostics summary
+    ratio_mean = (ratio_sum / ratio_den) if ratio_den > 0 else 0.0
+    ratio_var = max(0.0, (ratio_sq_sum / ratio_den) - ratio_mean * ratio_mean) if ratio_den > 0 else 0.0
+    ratio_std = math.sqrt(ratio_var)
+    old_lp_cov = (oldlp_cov_num / oldlp_cov_den) if oldlp_cov_den > 0 else 0.0
+    adv_abs_mean = (adv_abs_sum / adv_abs_den) if adv_abs_den > 0 else 0.0
+
     return {
         "loss": loss_val,
         "grad_norm": grad_norm_val,
@@ -421,4 +451,10 @@ def update_policy(
         "kl_div": kl_div_val,
         "clip_ratio": clip_ratio_val,
         "current_log_probs": None,
+        "metrics": {
+            "old_lp_cov": float(old_lp_cov),
+            "ratio_mean": float(ratio_mean),
+            "ratio_std": float(ratio_std),
+            "adv_abs_mean": float(adv_abs_mean),
+        },
     }

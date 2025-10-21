@@ -3,6 +3,7 @@
 # GRPO 训练脚本 - 双模型协同训练 LoRA（单进程同时训练并共同更新）
 
 echo "=== GRPO Two Models LoRA (Collaborative Training) ==="
+export VLLM_USE_V1=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PYTHON=${PYTHON:-python3}
 
@@ -21,22 +22,23 @@ mkdir -p checkpoints/two_model_lora
 #   模型1（Llama）：HF=索引1(3)，vLLM=索引3(5)
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
-  --models "Qwen/Qwen2.5-3B-Instruct" "meta-llama/Llama-3.2-3B-Instruct" \
+  --models "Qwen/Qwen2.5-3B-Instruct" "HuggingFaceTB/SmolLM3-3B" \
   --adapter lora \
   --dtype bfloat16 \
-  --lr 1e-5 \
   --epochs 1 \
-  --batch-size 32 \
+  --batch-size 128 \
   --num-answers 8 \
   --task-type math \
   --data-root "/workspace/data" \
   --max-steps 100 \
   --ckpt-dir "checkpoints/two_model_lora" \
   --ckpt-interval 0 \
-  --ppo-epochs 2 \
-  --val-interval 2 \
+  --ppo-epochs 1 \
+  --beta 0.2 \
+  --lr 5e-6 \
+  --val-interval 20 \
   --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
+  --advantage-clip 0.6 \
   --use-vllm --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 --vllm-gpus 2 3 \
   --rollout-batch-size 128 \
   --run-name "GRPO_TwoModels_LoRA_$(date +%Y%m%d_%H%M%S)" \

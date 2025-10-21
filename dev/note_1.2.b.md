@@ -10,3 +10,14 @@ Location: /usr/local/lib/python3.10/dist-packages
 Requires: aiohttp, blake3, cachetools, cbor2, cloudpickle, compressed-tensors, depyf, diskcache, einops, fastapi, filelock, gguf, huggingface-hub, lark, llguidance, lm-format-enforcer, mistral_common, msgspec, ninja, numba, numpy, openai, opencv-python-headless, outlines_core, partial-json-parser, pillow, prometheus-fastapi-instrumentator, prometheus_client, protobuf, psutil, py-cpuinfo, pybase64, pydantic, python-json-logger, pyyaml, pyzmq, ray, regex, requests, scipy, sentencepiece, tiktoken, tokenizers, torch, torchaudio, torchvision, tqdm, transformers, typing_extensions, watchfiles, xformers, xgrammar
 Required-by: 
 root@f525288f0ef0:/workspace# 
+
+
+
+
+docker run -it \
+  --gpus all \
+  --name grpo_s1 \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0 \
+  /bin/bash
