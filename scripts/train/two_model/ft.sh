@@ -1,118 +1,59 @@
 #!/bin/bash
 
-# GRPO训练脚本 - 三个模型并行全量微调（每模型两张卡：一张HF更新 + 一张vLLM推理）
+# GRPO 训练脚本 - 双模型协同训练 LoRA（单进程同时训练并共同更新）
 
-echo "=== GRPO Three Models Full Finetuning (HF+vLLM) ==="
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+echo "=== GRPO Two Models FT (Collaborative Training) ==="
+export VLLM_USE_V1=0
+# export CUDA_LAUNCH_BLOCKING=1
+# Disable expandable_segments to avoid allocator illegal access in multi-threaded rollout
+# Use expandable segments and tune allocator to reduce fragmentation while avoiding thread-time empty_cache calls
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8
+export TORCH_ALLOW_TF32=1
+export NVIDIA_TF32_OVERRIDE=1
 PYTHON=${PYTHON:-python3}
+export TOKENIZERS_PARALLELISM=true
+
+export TORCH_SHOW_CPP_STACKTRACES=1 VLLM_LOGGING_LEVEL=DEBUG
 
 # 创建必要的目录
 mkdir -p logs checkpoints
-mkdir -p checkpoints/qwen_full checkpoints/phi_full checkpoints/llama_full
+mkdir -p checkpoints/two_model_ft
 
-# GPU 配置（每模型两张卡，前者用于HF训练/更新，后者用于vLLM rollout）
-# Qwen  使用: 2(训练), 3(vLLM)
-# Phi   使用: 4(训练), 5(vLLM)
-# Llama 使用: 6(训练), 7(vLLM)
+# 单进程 + 双模型：将两种模型一起传入 --models，开启协同训练路径
+# 显卡分配：为每个模型分配两张卡（左=HF更新，右=vLLM rollout）。
+# 使用顺序：CUDA_VISIBLE_DEVICES=2,3,4,5 →
+#   模型0（Qwen）：HF=索引0(2)，vLLM=索引2(4)
+#   模型1（Llama）：HF=索引1(3)，vLLM=索引3(5)
 
-# Qwen 模型训练（全量微调）
-echo "Training Qwen with full finetuning..."
-CUDA_VISIBLE_DEVICES=2,3 ${PYTHON} train_new.py \
-  --models "Qwen/Qwen2.5-3B-Instruct" \
-  --dtype bfloat16 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
+  --models "Qwen/Qwen2.5-3B-Instruct" "HuggingFaceTB/SmolLM3-3B" \
   --adapter none \
-  --lr 2e-5 \
+  --dtype bfloat16 \
   --epochs 1 \
-  --batch-size 128 \
+  --batch-size 64 \
   --num-answers 8 \
   --task-type math \
   --data-root "/workspace/data" \
   --max-steps 100 \
-  --val-interval 2 \
-  --val-batch-size 64 \
-  --ckpt-dir "checkpoints/qwen_full" \
+  --ckpt-dir "checkpoints/two_model_ft" \
   --ckpt-interval 0 \
-  --ppo-epochs 2 \
-  --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
-  --use-vllm --vllm-gpu 1 --vllm-gpu-mem 0.5 --vllm-max-model-len 32768 \
-  --rollout-batch-size 128 \
+  --ppo-epochs 1 \
+  --beta 0.2 \
+  --lr 5e-6 \
   --use-ref-model \
-  --run-name "GRPO_Qwen2.5-3B-Instruct_full_$(date +%Y%m%d_%H%M%S)" \
-  > logs/qwen_full.log 2>&1 &
-
-QWEN_PID=$!
-
-# Phi 模型训练（全量微调）
-echo "Training Phi with full finetuning..."
-CUDA_VISIBLE_DEVICES=4,5 ${PYTHON} train_new.py \
-  --models "microsoft/Phi-3-mini-128k-instruct" \
-  --dtype bfloat16 \
-  --adapter none \
-  --lr 3e-5 \
-  --epochs 1 \
-  --batch-size 128 \
-  --num-answers 8 \
-  --task-type math \
-  --data-root "/workspace/data" \
-  --max-steps 100 \
-  --val-interval 2 \
-  --val-batch-size 64 \
-  --ckpt-dir "checkpoints/phi_full" \
-  --ckpt-interval 0 \
-  --ppo-epochs 2 \
+  --ppo-micro-batch-size 2 \
+  --val-interval 25 \
   --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
-  --use-vllm --vllm-gpu 1 --vllm-gpu-mem 0.5 --vllm-max-model-len 32768 \
-  --rollout-batch-size 128 \
-  --use-ref-model \
-  --run-name "GRPO_Phi-3-mini-128k-instruct_full_$(date +%Y%m%d_%H%M%S)" \
-  > logs/phi_full.log 2>&1 &
+  --advantage-clip 0.6 \
+  --use-vllm --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 --vllm-gpus 2 -1 \
+  --rollout-batch-size 64 \
+  --run-name "GRPO_TwoModels_FT_$(date +%Y%m%d_%H%M%S)" \
+  > logs/two_model_ft.log 2>&1 &
 
-PHI_PID=$!
+PID=$!
 
-# Llama 模型训练（全量微调）
-echo "Training Llama with full finetuning..."
-CUDA_VISIBLE_DEVICES=6,7 ${PYTHON} train_new.py \
-  --models "meta-llama/Llama-3.2-3B-Instruct" \
-  --dtype bfloat16 \
-  --adapter none \
-  --lr 1e-6 \
-  --epochs 1 \
-  --batch-size 128 \
-  --num-answers 8 \
-  --task-type math \
-  --data-root "/workspace/data" \
-  --max-steps 100 \
-  --val-interval 2 \
-  --val-batch-size 64 \
-  --ckpt-dir "checkpoints/llama_full" \
-  --ckpt-interval 0 \
-  --ppo-epochs 2 \
-  --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
-  --use-vllm --vllm-gpu 1 --vllm-gpu-mem 0.5 --vllm-max-model-len 32768 \
-  --rollout-batch-size 128 \
-  --use-ref-model \
-  --run-name "GRPO_Llama-3.2-3B-Instruct_full_$(date +%Y%m%d_%H%M%S)" \
-  > logs/llama_full.log 2>&1 &
+echo "Two-model FT collaborative training started! PID=$PID"
+echo "Check logs: tail -f logs/two_model_ft.log"
 
-LLAMA_PID=$!
-
-echo "All training started in parallel!"
-echo "PIDs: Qwen=$QWEN_PID, Phi=$PHI_PID, Llama=$LLAMA_PID"
-echo "Check logs: tail -f logs/qwen_full.log"
-echo "Check logs: tail -f logs/phi_full.log"
-echo "Check logs: tail -f logs/llama_full.log"
-
-# 等待所有任务完成
-wait $QWEN_PID
-echo "Qwen training completed!"
-
-wait $PHI_PID
-echo "Phi training completed!"
-
-wait $LLAMA_PID
-echo "Llama training completed!"
-
-echo "All parallel training completed!"
+wait $PID
+echo "Two-model FT collaborative training completed!"

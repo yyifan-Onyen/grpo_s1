@@ -14,6 +14,7 @@ from grpo import update_policy, get_log_probs
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import random
+from contextlib import nullcontext
 
 
 def _reward_worker(args):
@@ -73,6 +74,56 @@ def prepare_adapter_configs(args):
     return fact_config, lora_config
 
 
+def _sync_hf_weights(src_model: torch.nn.Module, dst_model: torch.nn.Module) -> None:
+    """Synchronize parameters and buffers from src to dst in-place across devices.
+
+    Assumes identical architecture/state_dict keys. Copies directly GPU→GPU with
+    non_blocking transfers where possible to minimize overhead.
+    """
+    with torch.no_grad():
+        # Parameters
+        src_params = dict(src_model.named_parameters())
+        for name, dst_p in dst_model.named_parameters():
+            sp = src_params.get(name, None)
+            if sp is None:
+                continue
+            try:
+                dst_p.data.copy_(sp.data.to(dst_p.device, dtype=dst_p.dtype, non_blocking=True))
+            except Exception:
+                dst_p.data.copy_(sp.data.to(dst_p.device, dtype=dst_p.dtype))
+        # Buffers (e.g., layernorm running stats if any)
+        src_bufs = dict(src_model.named_buffers())
+        for name, dst_b in dst_model.named_buffers():
+            sb = src_bufs.get(name, None)
+            if sb is None:
+                continue
+            try:
+                dst_b.data.copy_(sb.data.to(dst_b.device, dtype=dst_b.dtype, non_blocking=True))
+            except Exception:
+                dst_b.data.copy_(sb.data.to(dst_b.device, dtype=dst_b.dtype))
+
+
+def _empty_all_cuda_caches(devices: Optional[List[int]] = None) -> None:
+    try:
+        if not torch.cuda.is_available():
+            return
+        # Default: only clean current device to avoid creating unwanted contexts
+        if devices is None:
+            devices = [torch.cuda.current_device()]
+        cur = torch.cuda.current_device()
+        for d in devices:
+            try:
+                torch.cuda.set_device(d)
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        try:
+            torch.cuda.set_device(cur)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 def _rollout_model_batch(
     model_idx: int,
     model: "LanguageModel",
@@ -85,6 +136,7 @@ def _rollout_model_batch(
     temperature: float,
 ):
     per_question_eps: List[List[dict]] = [[] for _ in range(len(questions))]
+    _decode_t0 = time.perf_counter()
 
     if len(questions) == 0:
         return per_question_eps
@@ -105,41 +157,45 @@ def _rollout_model_batch(
     if len(prompts) == 0:
         return per_question_eps
 
-    decode_chunk_size = min(len(prompts), 256)
+    _name_lower = (name or "").lower()
+    _is_smol = ("smol" in _name_lower or "smollm" in _name_lower)
+    # Increase Smol's per-call decode parallelism as requested
+    decode_chunk_size = min(len(prompts), 128 if _is_smol else 256)
+    # Use rollout-only peer for generation if present (HF on a separate GPU)
+    _gen_model = getattr(model, "rollout_peer", None) or model
+    _use_vllm_now = (
+        getattr(_gen_model, "use_vllm", False)
+        and (
+            getattr(_gen_model, "vllm_engine", None) is not None
+            or getattr(_gen_model, "vllm_worker", None) is not None
+        )
+    )
+    _engine_label = "vLLM" if _use_vllm_now else "HF"
+
     for start in range(0, len(prompts), decode_chunk_size):
         end = min(start + decode_chunk_size, len(prompts))
         chunk_prompts = prompts[start:end]
         chunk_qrefs = q_refs[start:end]
-        completions, indices, masks, vllm_lps = model.generate(
-            prompts=chunk_prompts,
-            limitation=max_gen_len,
-            temperature=temperature,
-            verbose=True,
-            # OpenRLHF-style: vLLM 仅用于生成，旧策略对数概率由 HF/Actor 计算
-            return_log_probs=False,
-        )
-        for j, result in enumerate(completions):
-            q_idx = chunk_qrefs[j]
-            full_indices = indices[j]
-            mask = masks[j]
-            if torch.cuda.is_available() and full_indices.is_cuda:
-                try:
-                    torch.cuda.synchronize(full_indices.device)
-                except Exception:
-                    torch.cuda.synchronize()
-            fi_cpu = full_indices.detach().contiguous().to("cpu")
-            mk_cpu = mask.detach().contiguous().to("cpu")
-            prefix_token_ids = fi_cpu[~mk_cpu].tolist()
-            generated_token_ids = fi_cpu[mk_cpu].tolist()
-            old_lp = None
-            # 使用 HF/Actor 计算旧策略对数概率（OpenRLHF/VERL 风格），避免依赖 vLLM 的 logprobs
-            try:
-                # 将当前样本的序列搬到训练设备上计算对数概率
-                input_ids = full_indices[:-1].clone().unsqueeze(0).to(device)
-                target_ids = full_indices[1:].clone().unsqueeze(0).to(device)
-                target_masks = mask[1:].clone().unsqueeze(0).to(device)
+        try:
+            completions, indices, masks, vllm_lps = _gen_model.generate(
+                prompts=chunk_prompts,
+                limitation=max_gen_len,
+                temperature=temperature,
+                verbose=True,
+                # OpenRLHF-style: vLLM 仅用于生成，旧策略对数概率由 HF/Actor 计算
+                return_log_probs=False,
+            )
+        finally:
+            pass
+        # 批量计算旧策略对数概率，按小批分块控制显存
+        old_lp_list: list[list[float]] = []
+        try:
+            B = indices.size(0)
+            if B > 0:
+                idx_all = indices[:, :-1]
+                tgt_all = indices[:, 1:]
+                msk_all = masks[:, 1:]
 
-                # 暂时切换到推理友好设置，避免梯度检查点与 use_cache 干扰
                 prev_training = model.model.training
                 prev_use_cache = getattr(model.model.config, "use_cache", True)
                 had_gc = getattr(model.model, "is_gradient_checkpointing", False)
@@ -149,36 +205,64 @@ def _rollout_model_batch(
                 except Exception:
                     pass
                 try:
-                    model.model.config.use_cache = True
+                    model.model.config.use_cache = False
                 except Exception:
                     pass
-                with torch.inference_mode():
-                    lp = get_log_probs(
-                        model.model,
-                        input_ids,
-                        target_ids,
-                        target_masks,
-                        pad_token_id=tokenizer.pad_token_id,
-                        vocab_size=model.model.config.vocab_size,
-                        return_logits=False,
-                    )
-                old_lp = lp[0][target_masks[0]].detach().cpu().tolist()
-            except Exception as _e:
-                print(f"[TRAIN] old_log_probs (multi-model) fallback failed: {_e}")
-                old_lp = None
-            finally:
-                # 恢复训练时设置
+
                 try:
-                    model.model.config.use_cache = prev_use_cache
+                    p_dtype = next(model.model.parameters()).dtype
+                except Exception:
+                    p_dtype = torch.bfloat16
+
+                lp_bs = min(B, 16)
+                with torch.inference_mode():
+                    amp_ctx = (
+                        torch.autocast(device_type="cuda", dtype=p_dtype)
+                        if torch.cuda.is_available() else nullcontext()
+                    )
+                    with amp_ctx:
+                        for s in range(0, B, lp_bs):
+                            e = min(s + lp_bs, B)
+                            idx_gpu = idx_all[s:e].to(device, non_blocking=True)
+                            tgt_gpu = tgt_all[s:e].to(device, non_blocking=True)
+                            msk_gpu = msk_all[s:e].to(device, non_blocking=True)
+                            lp_batch = get_log_probs(
+                                model.model,
+                                idx_gpu,
+                                tgt_gpu,
+                                msk_gpu,
+                                pad_token_id=tokenizer.pad_token_id,
+                                vocab_size=model.model.config.vocab_size,
+                                return_logits=False,
+                            )
+                            for bi in range(e - s):
+                                sel = msk_gpu[bi].bool()
+                                old_lp_list.append(lp_batch[bi][sel].detach().cpu().tolist())
+        except Exception as _e:
+            print(f"[TRAIN] old_log_probs (multi-model, batched) failed: {_e}")
+            old_lp_list = [[] for _ in range(len(completions))]
+        finally:
+            try:
+                model.model.config.use_cache = prev_use_cache
+            except Exception:
+                pass
+            if had_gc:
+                try:
+                    model.model.gradient_checkpointing_enable()
                 except Exception:
                     pass
-                if had_gc:
-                    try:
-                        model.model.gradient_checkpointing_enable()
-                    except Exception:
-                        pass
-                if prev_training:
-                    model.model.train()
+            if prev_training:
+                model.model.train()
+
+        for j, result in enumerate(completions):
+            q_idx = chunk_qrefs[j]
+            full_indices = indices[j]
+            mask = masks[j]
+            fi_cpu = full_indices.detach().contiguous().to("cpu")
+            mk_cpu = mask.detach().contiguous().to("cpu")
+            prefix_token_ids = fi_cpu[~mk_cpu].tolist()
+            generated_token_ids = fi_cpu[mk_cpu].tolist()
+            old_lp = old_lp_list[j] if j < len(old_lp_list) else None
             episode = {
                 "prefix_token_ids": prefix_token_ids,
                 "generated_token_ids": generated_token_ids,
@@ -190,8 +274,18 @@ def _rollout_model_batch(
             }
             per_question_eps[q_idx].append(episode)
         del completions, indices, masks, vllm_lps
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Avoid calling empty_cache/gc inside rollout threads; this can trigger
+        # allocator issues under expandable_segments in multi-threaded context.
+        # Cleanup is performed at coarser-grained points in the main loop.
+
+    _decode_elapsed = time.perf_counter() - _decode_t0
+    try:
+        print(
+            f"[timing][rollout] {name} ({device}) decode={_decode_elapsed:.2f}s, prompts={len(prompts)}, chunk={decode_chunk_size}, engine={_engine_label}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     return per_question_eps
 
@@ -409,13 +503,26 @@ def main():
         "float32": torch.float32,
     }
     dtype = dtype_map.get(args.dtype, torch.bfloat16)
+    # Enable TF32 and memory-efficient SDPA for lower FP32 peak usage (esp. Smol)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        try:
+            torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False)
+        except Exception:
+            pass
+    except Exception:
+        pass
     torch.random.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     
 
     num_gpus = torch.cuda.device_count()
-    print(f"Available GPUs: {num_gpus}")
+    print(f"Available GPUs: {num_gpus}", flush=True)
     if num_gpus < num_models:
         print(f"Error: Need at least {num_models} GPUs for manual assignment, but only {num_gpus} available")
         return
@@ -425,14 +532,16 @@ def main():
     ref_models = []  # Reference models for KL divergence
     model_names = [Path(path).name for path in pretrained_model_paths]
     target_devices = [f"cuda:{i}" for i in range(num_models)]
-    print(target_devices)
+    print(target_devices, flush=True)
     # exit()
     
     for i, (model_path, name, device) in enumerate(zip(pretrained_model_paths, model_names, target_devices)):
-        print(f"Loading {name} on {device}...")
+        import time as _time
+        _t0 = _time.perf_counter()
+        print(f"[{_t0:.3f}] Loading {name} on {device}...", flush=True)
         
         # Load main model
-        # Choose per-model vLLM GPU id if provided
+        # Resolve per-model vLLM GPU id and whether to enable vLLM for this model
         per_model_vllm_gpu = None
         try:
             if getattr(args, "vllm_gpus", None) is not None and len(args.vllm_gpus) > i:
@@ -442,25 +551,45 @@ def main():
         except Exception:
             per_model_vllm_gpu = getattr(args, "vllm_gpu", None)
 
+        per_model_use_vllm = bool(getattr(args, "use_vllm", False))
+        try:
+            if per_model_vllm_gpu is not None and int(per_model_vllm_gpu) < 0:
+                per_model_use_vllm = False
+        except Exception:
+            pass
+
+        # Prefer FA2; allow Smol to also use FA2 per user request
+        _attn_impl = "flash"
+        try:
+            _n = (name or "").lower()
+            _p = (str(model_path) or "").lower()
+        except Exception:
+            pass
+
+        # Use global dtype for all models; avoid forcing Smol to fp16 to reduce overflow risk
+        _dtype_for_this = dtype
+
         model = LanguageModel(
             model_path=str(model_path),
             target_device=device,
-            torch_dtype=dtype,
-            attn_impl="flash",
+            torch_dtype=_dtype_for_this,
+            attn_impl=_attn_impl,
             fact_config=fact_config,
             lora_config=lora_config,
             gradient_checkpointing=True,
-            use_vllm=getattr(args, "use_vllm", False),
+            use_vllm=per_model_use_vllm,
             vllm_gpu_memory_utilization=getattr(args, "vllm_gpu_mem", None),
-            vllm_gpu_id=per_model_vllm_gpu,
+            vllm_gpu_id=per_model_vllm_gpu if per_model_use_vllm else None,
             vllm_max_model_len=getattr(args, "vllm_max_model_len", None),
         )
         model.model.train()
         models.append(model)
+        _t1 = _time.perf_counter()
+        print(f"[{_t1:.3f}] {name} loaded. elapsed={_t1 - _t0:.3f}s", flush=True)
         
         # Load reference model (copy of initial model for KL divergence)
         if args.use_ref_model:
-            print(f"  Loading reference model for {name}...")
+            print(f"  Loading reference model for {name}...", flush=True)
             ref_model = LanguageModel(
                 model_path=str(model_path),
                 target_device=device,
@@ -478,26 +607,136 @@ def main():
         else:
             ref_models.append(None)
         
-        torch.cuda.empty_cache()
+        _empty_all_cuda_caches()
         gc.collect()
         
-        print(f"  {name} loaded successfully on {device}")
+        print(f"  {name} loaded successfully on {device}", flush=True)
 
     tokenizers = [model.tokenizer for model in models]
 
+    # Track which local devices we should clean caches on (avoid vLLM device)
+    _cache_devices_set = set(range(num_models))  # training HF devices: 0..N-1
+
+    # Create rollout-only HF replicas for models without vLLM to offload generation
+    # to spare GPUs (e.g., Smol -> cuda:3 when Qwen uses vLLM on cuda:2).
+    # The replica runs eval-only, no optimizer, and keeps use_cache=False to save memory.
+    rollout_peers = [None for _ in range(num_models)]
+    try:
+        all_local_idxs = set(range(num_gpus))
+        used_local_hf = set(range(num_models))  # cuda:0..N-1 for training HF
+        used_local_vllm = set()
+        try:
+            if getattr(args, "vllm_gpus", None):
+                for _gi in args.vllm_gpus:
+                    try:
+                        _iv = int(_gi)
+                        if _iv >= 0:
+                            used_local_vllm.add(_iv)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        used_local = used_local_hf.union(used_local_vllm)
+        available_local = sorted(list(all_local_idxs - used_local))
+        # Assign rollout peers greedily to models that do not use vLLM
+        for i, m in enumerate(models):
+            wants_rollout_peer = not getattr(m, "use_vllm", False)
+            if not wants_rollout_peer:
+                continue
+            if not available_local:
+                break
+            peer_local_idx = available_local.pop()  # prefer highest index
+            peer_device = f"cuda:{peer_local_idx}"
+            try:
+                print(f"[rollout-peer] Creating HF rollout replica for {model_names[i]} on {peer_device}")
+                try:
+                    _first_p = next(models[i].model.parameters())
+                    _peer_dtype = _first_p.dtype
+                except Exception:
+                    _peer_dtype = dtype
+                peer = LanguageModel(
+                    model_path=str(pretrained_model_paths[i]),
+                    target_device=peer_device,
+                    torch_dtype=_peer_dtype,
+                    attn_impl=getattr(models[i], "attn_impl", "sdpa"),
+                    fact_config=fact_config,
+                    lora_config=lora_config,
+                    gradient_checkpointing=False,
+                    use_vllm=False,
+                )
+                # Inference-only, save memory
+                peer.model.eval()
+                try:
+                    peer.model.config.use_cache = True
+                except Exception:
+                    pass
+                for p in peer.model.parameters():
+                    p.requires_grad = False
+
+                # Initial sync from training model to rollout peer
+                _sync_hf_weights(models[i].model, peer.model)
+
+                rollout_peers[i] = peer
+                # Attach to training model for transparent usage in rollout
+                setattr(models[i], "rollout_peer", peer)
+                print(f"[rollout-peer] Ready for {model_names[i]} on {peer_device}")
+                # Also mark this device for cache cleaning
+                _cache_devices_set.add(peer_local_idx)
+            except Exception as _e:
+                print(f"[rollout-peer] Failed to create replica for {model_names[i]}: {_e}")
+                rollout_peers[i] = None
+    except Exception as _e:
+        print(f"[rollout-peer] setup skipped due to error: {_e}")
+
+    # Exclude vLLM devices from cache cleaning to avoid creating contexts there
+    try:
+        if getattr(args, "vllm_gpus", None):
+            for _gi in args.vllm_gpus:
+                try:
+                    _iv = int(_gi)
+                    if _iv >= 0 and _iv in _cache_devices_set:
+                        _cache_devices_set.remove(_iv)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    _cache_devices = sorted(list(_cache_devices_set))
+    print(f"[mem] cache-clean devices={_cache_devices} (local indices)")
+
     # 若启用 vLLM：在首次解码前进行一次逐参数热更新，使首个 rollout 即使用 vLLM 权重
     if getattr(args, "use_vllm", False):
-        for model, name in zip(models, model_names):
+        import os as _os  # local import to avoid top-level pollution
+        # 环境级别控制：全局跳过或按模型跳过（索引或名称，逗号分隔）
+        _skip_all = _os.getenv("SKIP_VLLM_HOT_UPDATE", "0") == "1"
+        _skip_spec = _os.getenv("SKIP_VLLM_HOT_UPDATE_MODELS", "")
+        _skip_idx: set[int] = set()
+        _skip_names: set[str] = set()
+        if _skip_spec:
+            for _tok in [t.strip() for t in _skip_spec.split(",") if t.strip()]:
+                try:
+                    _skip_idx.add(int(_tok))
+                except Exception:
+                    _skip_names.add(_tok.lower())
+
+        for _i, (model, name) in enumerate(zip(models, model_names)):
             try:
+                # 可通过环境变量显式跳过（全局或按模型）
+                if _skip_all or (_i in _skip_idx) or (name.lower() in _skip_names):
+                    print(f"[vLLM] {name}: skip initial hot update by env.")
+                    continue
                 if getattr(model, "use_vllm", False) and (
                     getattr(model, "vllm_worker", None) is not None or getattr(model, "vllm_engine", None) is not None
                 ):
                     # Skip hot update for LoRA; vLLM supports native LoRA adapters
                     if getattr(model, "lora_config", None) is not None:
                         continue
+                    _t0 = time.perf_counter()
+                    print(f"[vLLM] {name}: starting initial hot update...", flush=True)
                     ok = False
                     if hasattr(model, "hot_update_vllm_full_weights"):
                         ok = bool(model.hot_update_vllm_full_weights())
+                    _t1 = time.perf_counter()
+                    print(f"[vLLM] {name}: initial hot update done={ok}, elapsed={_t1-_t0:.2f}s", flush=True)
                     if not ok:
                         raise RuntimeError(f"[vLLM] {name}: initial hot update failed (no fallback).")
             except Exception as _e:
@@ -600,7 +839,7 @@ def main():
 
                 # 优先使用持久化的 vLLM 引擎（线程安全），必要时退回一次性合并评估
                 def _gen_eval(_prompts: List[str]):
-                    # 验证优先使用已有 vLLM worker/engine；避免每次导出合并并新建临时引擎
+                    # 验证优先使用已有 vLLM worker/engine；否则回退到 HF（优先 rollout_peer）
                     try:
                         if getattr(args, "use_vllm", False):
                             if getattr(_model, "vllm_worker", None) is not None or getattr(_model, "vllm_engine", None) is not None:
@@ -612,8 +851,14 @@ def main():
                                 )
                     except Exception:
                         pass
-                    # 不允许回退到 HF：验证阶段 vLLM 不可用即报错
-                    raise RuntimeError(f"[VAL] {_name}: vLLM not available for validation (no fallback).")
+                    # HF 回退：优先使用 rollout_peer 以降低显存占用
+                    _eval_model = getattr(_model, "rollout_peer", None) or _model
+                    return _eval_model.generate(
+                        prompts=_prompts,
+                        limitation=MAX_GEN_LEN,
+                        temperature=VAL_TEMPERATURE,
+                        verbose=False,
+                    )
 
                 def _extract_completions(gen_out):
                     # 兼容 generate 返回 (completions, indices, masks, log_probs) 的情况
@@ -977,7 +1222,7 @@ def main():
                                         try:
                                             _single = tokenizer(
                                                 ep.get("completion", ""),
-                                    return_tensors="pt", 
+                                                return_tensors="pt", 
                                                 add_special_tokens=False,
                                             )
                                             new_completion_ids = _single["input_ids"][0].tolist()
@@ -1003,7 +1248,8 @@ def main():
                                             "generated_token_ids": converted_ids,
                                             "reward": ep.get("reward"),
                                             "completion": ep.get("completion"),
-                                            "old_log_probs": ep.get("old_log_probs"),
+                                            # Cross-model samples carry wrong-policy old_log_probs; disable to avoid ratio mismatch
+                                            "old_log_probs": None,
                                         }
                                     )
 
@@ -1056,7 +1302,8 @@ def main():
                                             "generated_token_ids": converted_ids,
                                             "reward": ep.get("reward"),
                                             "completion": ep.get("completion"),
-                                            "old_log_probs": ep.get("old_log_probs"),
+                                            # Cross-model samples: do not use other model's old_log_probs
+                                            "old_log_probs": None,
                                         }
                                     )
 
@@ -1117,7 +1364,7 @@ def main():
                         per_model_assembly[name] = time.perf_counter() - per_model_start
 
                     mm_decode_buffer = []
-                    torch.cuda.empty_cache()
+                    _empty_all_cuda_caches(_cache_devices)
                     gc.collect()
 
                     assemble_duration = time.perf_counter() - assemble_start
@@ -1162,8 +1409,12 @@ def main():
                     )
                     engine_label = "vLLM" if use_vllm_now else "HF"
                     print(f"  {name} ({device}): Decoding {len(prompts)} prompts with {engine_label}...")
+                    # Reduce Smol's per-call decode parallelism to lower peak memory
+                    _name_lower = (name or "").lower()
+                    _is_smol = ("smol" in _name_lower or "smollm" in _name_lower)
                     # Decode in chunks to avoid OOM (cap per-call prompts)
-                    decode_chunk_size = min(len(prompts), 256)
+                    decode_chunk_size = min(len(prompts), 128 if _is_smol else 256)
+                    _single_decode_t0 = time.perf_counter()
                     model_rewards = []
                     processed = 0
                     for start_idx in range(0, len(prompts), decode_chunk_size):
@@ -1178,36 +1429,22 @@ def main():
                             # OpenRLHF-style: vLLM 仅用于生成，旧策略对数概率由 HF/Actor 计算
                             return_log_probs=False,
                         )
-                        for j, result in enumerate(completions):
-                            sample = chunk_refs[j]
-                            # Defer reward computation; fill later via process pool
-                            reward_result = None
-                            full_indices = indices[j]
-                            mask = masks[j]
-                            # Avoid GPU boolean indexing to prevent launching kernels that can surface prior async errors
-                            if torch.cuda.is_available() and full_indices.is_cuda:
-                                try:
-                                    torch.cuda.synchronize(full_indices.device)
-                                except Exception:
-                                    torch.cuda.synchronize()
-                            fi_cpu = full_indices.detach().contiguous().to("cpu")
-                            mk_cpu = mask.detach().contiguous().to("cpu")
-                            prefix_token_ids = fi_cpu[~mk_cpu].tolist()
-                            generated_token_ids = fi_cpu[mk_cpu].tolist()
-                            old_lp = None
-                            if isinstance(vllm_lps, list) and j < len(vllm_lps) and vllm_lps[j] is not None:
-                                try:
-                                    old_lp = vllm_lps[j].detach().cpu().tolist()
-                                except Exception:
-                                    old_lp = None
-                            if old_lp is None:
-                                try:
-                                    # Clone to avoid "inference tensors" autograd error
-                                    input_ids = full_indices[:-1].clone().unsqueeze(0).to(device)
-                                    target_ids = full_indices[1:].clone().unsqueeze(0).to(device)
-                                    target_masks = mask[1:].clone().unsqueeze(0).to(device)
+                        # 批量计算旧策略对数概率（优先使用 vLLM 提供的，否则批量前向）
+                        old_lp_batch: list[list[float]] = []
+                        try:
+                            if isinstance(vllm_lps, list) and len(vllm_lps) == len(completions) and all(x is not None for x in vllm_lps):
+                                for x in vllm_lps:
+                                    try:
+                                        old_lp_batch.append(x.detach().cpu().tolist())
+                                    except Exception:
+                                        old_lp_batch.append([])
+                            else:
+                                B = indices.size(0)
+                                if B > 0:
+                                    idx_all = indices[:, :-1]
+                                    tgt_all = indices[:, 1:]
+                                    msk_all = masks[:, 1:]
 
-                                    # Temporarily use inference-friendly mode for log_prob computation
                                     prev_training = model.model.training
                                     prev_use_cache = getattr(model.model.config, "use_cache", True)
                                     had_gc = getattr(model.model, "is_gradient_checkpointing", False)
@@ -1217,36 +1454,66 @@ def main():
                                     except Exception:
                                         pass
                                     try:
-                                        model.model.config.use_cache = True
+                                        model.model.config.use_cache = False
                                     except Exception:
                                         pass
-                                    with torch.inference_mode():
-                                        lp = get_log_probs(
-                                            model.model,
-                                            input_ids,
-                                            target_ids,
-                                            target_masks,
-                                            pad_token_id=tokenizer.pad_token_id,
-                                            vocab_size=model.model.config.vocab_size,
-                                            return_logits=False,
-                                        )
-                                    old_lp = lp[0][target_masks[0]].detach().cpu().tolist()
-                                except Exception as _e:
-                                    print(f"[TRAIN] old_log_probs fallback failed: {_e}")
-                                    old_lp = None
-                                finally:
-                                    # Restore training-time settings
+
                                     try:
-                                        model.model.config.use_cache = prev_use_cache
+                                        p_dtype = next(model.model.parameters()).dtype
                                     except Exception:
-                                        pass
-                                    if had_gc:
-                                        try:
-                                            model.model.gradient_checkpointing_enable()
-                                        except Exception:
-                                            pass
-                                    if prev_training:
-                                        model.model.train()
+                                        p_dtype = torch.bfloat16
+
+                                    lp_bs = min(B, 16)
+                                    with torch.inference_mode():
+                                        amp_ctx = (
+                                            torch.autocast(device_type="cuda", dtype=p_dtype)
+                                            if torch.cuda.is_available() else nullcontext()
+                                        )
+                                        with amp_ctx:
+                                            for s in range(0, B, lp_bs):
+                                                e2 = min(s + lp_bs, B)
+                                                idx_gpu = idx_all[s:e2].to(device, non_blocking=True)
+                                                tgt_gpu = tgt_all[s:e2].to(device, non_blocking=True)
+                                                msk_gpu = msk_all[s:e2].to(device, non_blocking=True)
+                                                lp_batch = get_log_probs(
+                                                    model.model,
+                                                    idx_gpu,
+                                                    tgt_gpu,
+                                                    msk_gpu,
+                                                    pad_token_id=tokenizer.pad_token_id,
+                                                    vocab_size=model.model.config.vocab_size,
+                                                    return_logits=False,
+                                                )
+                                                for bi in range(e2 - s):
+                                                    sel = msk_gpu[bi].bool()
+                                                    old_lp_batch.append(lp_batch[bi][sel].detach().cpu().tolist())
+                        except Exception as _e:
+                            print(f"[TRAIN] old_log_probs (single-model, batched) failed: {_e}")
+                            old_lp_batch = [[] for _ in range(len(completions))]
+                        finally:
+                            try:
+                                model.model.config.use_cache = prev_use_cache
+                            except Exception:
+                                pass
+                            if had_gc:
+                                try:
+                                    model.model.gradient_checkpointing_enable()
+                                except Exception:
+                                    pass
+                            if prev_training:
+                                model.model.train()
+
+                        for j, result in enumerate(completions):
+                            sample = chunk_refs[j]
+                            # Defer reward computation; fill later via process pool
+                            reward_result = None
+                            full_indices = indices[j]
+                            mask = masks[j]
+                            fi_cpu = full_indices.detach().contiguous().to("cpu")
+                            mk_cpu = mask.detach().contiguous().to("cpu")
+                            prefix_token_ids = fi_cpu[~mk_cpu].tolist()
+                            generated_token_ids = fi_cpu[mk_cpu].tolist()
+                            old_lp = old_lp_batch[j] if j < len(old_lp_batch) else None
                             episode_data = {
                                 "prefix_token_ids": prefix_token_ids,
                                 "generated_token_ids": generated_token_ids,
@@ -1262,6 +1529,14 @@ def main():
                         del completions, indices, masks, vllm_lps
                         torch.cuda.empty_cache()
                         gc.collect()
+                    try:
+                        _single_elapsed = time.perf_counter() - _single_decode_t0
+                        print(
+                            f"[timing][rollout] {name} ({device}) decode={_single_elapsed:.2f}s, prompts={len(prompts)}, chunk={decode_chunk_size}, engine={engine_label}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                     # Compute rewards for single-model path
                     if args.task_type in ("math", "code"):
                         reward_type = "math" if args.task_type == "math" else "code"
@@ -1305,7 +1580,7 @@ def main():
                             print(f"    {name}: Batch rollout finished. No reward tasks queued.")
                     del prompts, sample_refs
                     decode_buffer = []
-                    torch.cuda.empty_cache()
+                    _empty_all_cuda_caches(_cache_devices)
                     gc.collect()
             # Check if we should perform batch policy update
             should_update = False
@@ -1461,6 +1736,21 @@ def main():
                             except Exception:
                                 pass
 
+                            # Log per-model training metrics within the loop to ensure
+                            # every model writes its own step to wandb.
+                            if _WANDB_AVAILABLE:
+                                try:
+                                    wandb.log({
+                                        f"train/loss/{name}": float(update_result["loss"]),
+                                        f"train/grad_norm/{name}": float(update_result["grad_norm"]),
+                                        f"train/entropy/{name}": float(update_result["entropy"]),
+                                        f"train/kl_div/{name}": float(update_result["kl_div"]),
+                                        f"train/clip_ratio/{name}": float(update_result["clip_ratio"]),
+                                        "train/step": batch_step,
+                                    }, step=batch_step)
+                                except Exception as _e:
+                                    print(f"[wandb] log failed: {_e}")
+
                     if _WANDB_AVAILABLE:
                         try:
                             wandb.log({
@@ -1477,14 +1767,51 @@ def main():
                     # Hot-update vLLM weights without engine restart (dense/FacT)
                     # Do this in main thread to avoid engine races with vLLM
                     model = models[model_idx]
-                    if getattr(args, "use_vllm", False) and getattr(model, "lora_config", None) is None:
-                        ok = False
-                        if hasattr(model, "hot_update_vllm_full_weights"):
-                            ok = bool(model.hot_update_vllm_full_weights())
-                        if not ok:
-                            raise RuntimeError(
-                                f"[vLLM] {name}: hot update failed; aborting (no restart fallback)."
-                            )
+                    has_vllm = (
+                        getattr(model, "use_vllm", False)
+                        and (
+                            getattr(model, "vllm_engine", None) is not None
+                            or getattr(model, "vllm_worker", None) is not None
+                        )
+                    )
+                    if has_vllm and getattr(model, "lora_config", None) is None:
+                        import os as _os2
+                        _skip_all2 = _os2.getenv("SKIP_VLLM_HOT_UPDATE", "0") == "1"
+                        _skip_spec2 = _os2.getenv("SKIP_VLLM_HOT_UPDATE_MODELS", "")
+                        _skip_idx2: set[int] = set()
+                        _skip_names2: set[str] = set()
+                        if _skip_spec2:
+                            for _tok in [t.strip() for t in _skip_spec2.split(",") if t.strip()]:
+                                try:
+                                    _skip_idx2.add(int(_tok))
+                                except Exception:
+                                    _skip_names2.add(_tok.lower())
+                        if _skip_all2 or (model_idx in _skip_idx2) or (name.lower() in _skip_names2):
+                            print(f"[vLLM] {name}: skip step hot update by env.")
+                        else:
+                            _u0 = time.perf_counter()
+                            print(f"[vLLM] {name}: step hot update starting...", flush=True)
+                            ok = False
+                            if hasattr(model, "hot_update_vllm_full_weights"):
+                                ok = bool(model.hot_update_vllm_full_weights())
+                            _u1 = time.perf_counter()
+                            print(f"[vLLM] {name}: step hot update done={ok}, elapsed={_u1-_u0:.2f}s", flush=True)
+                            if not ok:
+                                raise RuntimeError(
+                                    f"[vLLM] {name}: hot update failed; aborting (no restart fallback)."
+                                )
+                    else:
+                        # No vLLM attached for this model or using LoRA-only path; skip safely
+                        print(f"[vLLM] {name}: skip step hot update (no vLLM engine/worker).", flush=True)
+                    # After optimizer step, keep rollout-only HF replica in sync (if any)
+                    try:
+                        _peer = getattr(models[model_idx], "rollout_peer", None)
+                        if _peer is not None:
+                            print(f"[rollout-peer] syncing weights to replica for {name}...")
+                            _sync_hf_weights(models[model_idx].model, _peer.model)
+                            print(f"[rollout-peer] sync done for {name}.")
+                    except Exception as _se:
+                        print(f"[rollout-peer] sync failed for {name}: {_se}")
                     
                     torch.cuda.empty_cache()
                     gc.collect()
@@ -1532,8 +1859,8 @@ def main():
                         ckpt_path = Path(args.ckpt_dir) / f"{name}_step_{batch_step}"
                         model.save(str(ckpt_path))
                         print(f"Saved checkpoint for {name} at step {batch_step}")
-                        torch.cuda.empty_cache()
-                        gc.collect()
+                    _empty_all_cuda_caches(_cache_devices)
+                    gc.collect()
 
             if training_done:
                 break

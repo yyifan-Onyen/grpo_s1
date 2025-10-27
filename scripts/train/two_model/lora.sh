@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
   --adapter lora \
   --dtype bfloat16 \
   --epochs 1 \
-  --batch-size 128 \
+  --batch-size 64 \
   --num-answers 8 \
   --task-type math \
   --data-root "/workspace/data" \
@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
   --loss-aggregation token-mean \
   --advantage-clip 0.6 \
   --use-vllm --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 --vllm-gpus 2 3 \
-  --rollout-batch-size 128 \
+  --rollout-batch-size 64 \
   --run-name "GRPO_TwoModels_LoRA_$(date +%Y%m%d_%H%M%S)" \
   > logs/two_model_lora.log 2>&1 &
 

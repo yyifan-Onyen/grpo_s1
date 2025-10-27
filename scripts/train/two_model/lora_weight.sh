@@ -6,6 +6,8 @@
 # GRPO 训练脚本 - 双模型协同训练 LoRA（单进程同时训练并共同更新）
 
 echo "=== GRPO Two Models LoRA (Weight Mode) ==="
+export VLLM_USE_V1=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PYTHON=${PYTHON:-python3}
 
 export TOKENIZERS_PARALLELISM=true
@@ -23,10 +25,10 @@ mkdir -p checkpoints/two_model_lora_weight
 #   模型1（Llama）：HF=索引1(3)，vLLM=索引3(5)
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
-  --models "Qwen/Qwen2.5-3B-Instruct" "meta-llama/Llama-3.2-3B-Instruct" \
+  --models "Qwen/Qwen2.5-3B-Instruct" "HuggingFaceTB/SmolLM3-3B" \
   --adapter lora \
   --dtype bfloat16 \
-  --lr 1e-5 \
+  --lr 5e-6 \
   --epochs 1 \
   --batch-size 64 \
   --num-answers 8 \
@@ -37,11 +39,12 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
   --ckpt-dir "checkpoints/two_model_lora_weight" \
   --ckpt-interval 0 \
   --ppo-epochs 1 \
-  --val-interval 4 \
+  --beta 0.2 \
+  --val-interval 25 \
   --loss-aggregation token-mean \
-  --advantage-clip 2.0 \
+  --advantage-clip 0.6 \
   --use-vllm --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 --vllm-gpus 2 3 \
-  --rollout-batch-size 128 \
+  --rollout-batch-size 64 \
   --run-name "GRPO_TwoModels_LoRA_Weight_$(date +%Y%m%d_%H%M%S)" \
   > logs/two_model_lora_weight.log 2>&1 &
 

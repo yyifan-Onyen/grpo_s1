@@ -1,10 +1,12 @@
 from typing import List, Dict, Tuple, Optional, Union, Any
+from contextlib import nullcontext
 import torch
 import json
 import os
 import tempfile
 import shutil
 import time
+from datetime import datetime
 import gc
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
@@ -95,15 +97,35 @@ class LanguageModel(object):
         self.vllm_max_model_len = vllm_max_model_len
         self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
         
+        def _ts() -> str:
+            return datetime.now().strftime("%H:%M:%S.%f")
+        print(f"[{_ts()}][LM] init start: model={model_path}, device={target_device}", flush=True)
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+        # Prefer left padding for decoder-only models to ensure correct generation
+        try:
+            if getattr(self.tokenizer, "padding_side", None) != "left":
+                self.tokenizer.padding_side = "left"
+        except Exception:
+            pass
+        print(f"[{_ts()}][LM] tokenizer loaded: model={model_path}", flush=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
         self.device = target_device
-        
+        # Remember requested attention backend
+        self.attn_impl = attn_impl
+
+        # vLLM runtime handles (initialized later; worker preferred, inline as fallback)
+        self.vllm_target_gpu = vllm_gpu_id
+        self.vllm_engine = None
+        self.vllm_worker: Optional[VLLMWorkerProxy] = None
+        self.use_vllm = bool(use_vllm and _VLLM_AVAILABLE)
+
         # Load model with attention backend selection (auto prefers flash_attention_2)
         def _load_with_attn(impl: str):
+            print(f"[{_ts()}][LM] from_pretrained enter: impl={impl}, model={model_path}", flush=True)
             return AutoModelForCausalLM.from_pretrained(
                 model_path,
                 device_map=target_device if target_device != "cpu" else None,
@@ -130,12 +152,20 @@ class LanguageModel(object):
         else:
             self.model = _load_with_attn("sdpa")
             selected_impl = "sdpa"
+        print(f"[{_ts()}][LM] HF model instantiated: impl={selected_impl}, model={model_path}", flush=True)
         
         # If target device is CPU, don't specify device_map but move manually
         if target_device == "cpu":
             self.model = self.model.to("cpu")
-        
-        print(f"Model {model_path} loaded on device: {target_device}")
+
+        try:
+            if torch.cuda.is_available() and target_device.startswith("cuda"):
+                dev_idx = int(str(target_device).split(":")[-1]) if ":" in str(target_device) else 0
+                free, total = torch.cuda.mem_get_info(dev_idx)
+                print(f"[{_ts()}][LM] cuda mem (GiB): free={free/2**30:.2f}, total={total/2**30:.2f} on {target_device}", flush=True)
+        except Exception:
+            pass
+        print(f"[{_ts()}][LM] Model loaded on device: {target_device} for {model_path}", flush=True)
         
         # Configure gradient checkpointing if enabled
         if gradient_checkpointing:
@@ -145,11 +175,8 @@ class LanguageModel(object):
                 self.model.enable_input_require_grads()
             except Exception:
                 pass
-            print(f"Gradient checkpointing enabled for {model_path}")
+            print(f"[{_ts()}][LM] Gradient checkpointing enabled for {model_path}", flush=True)
         
-        # Initialize vLLM desire early; FacT may disable it for rollout
-        self.use_vllm = bool(use_vllm and _VLLM_AVAILABLE)
-
         # Apply FacT if configured
         if fact_config is not None:
             target_modules = fact_config.get("fact_target_modules", ["q_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
@@ -208,15 +235,12 @@ class LanguageModel(object):
         self.gradient_checkpointing_enabled = gradient_checkpointing
 
         # Optional vLLM engine for fast generation (HF model still used for training)
-        # vLLM target GPU local index (within CUDA_VISIBLE_DEVICES) or absolute id if not set
-        self.vllm_target_gpu = vllm_gpu_id
-        self.vllm_engine = None
-        self.vllm_worker: Optional[VLLMWorkerProxy] = None
         if self.use_vllm and not _VLLM_AVAILABLE:
             self.use_vllm = False
         if self.use_vllm:
             try:
                 visible_cuda = self._resolve_vllm_visible_device(self.vllm_target_gpu)
+                print(f"[{_ts()}][vLLM] init start: model={model_path}, visible_cuda={visible_cuda}", flush=True)
                 if torch_dtype == torch.bfloat16:
                     dtype_str = "bfloat16"
                 elif torch_dtype == torch.float16:
@@ -240,7 +264,7 @@ class LanguageModel(object):
                         print(
                             f"[vLLM] worker enabled for {model_path} on "
                             f"CUDA_VISIBLE_DEVICES={self.vllm_worker.visible_cuda or 'auto'}"
-                        )
+                        , flush=True)
                     except Exception as _e:
                         print(f"[vLLM] worker init failed for {model_path}: {_e}. Trying inline engine.")
                         self.vllm_worker = None
@@ -266,7 +290,7 @@ class LanguageModel(object):
                                 self.vllm_engine = VLLMEngine(**kwargs, max_model_len=int(vllm_max_model_len))
                         else:
                             self.vllm_engine = VLLMEngine(**kwargs)
-                        print(f"vLLM engine enabled for {model_path}")
+                        print(f"[{_ts()}][vLLM] engine enabled for {model_path}", flush=True)
                     finally:
                         if target_cvd is not None:
                             if prev_cvd is None:
@@ -294,6 +318,9 @@ class LanguageModel(object):
         if target_index is None:
             return None
         try:
+            # Negative index disables binding
+            if int(target_index) < 0:
+                return None
             cur_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
             if cur_cvd:
                 devices = [p.strip() for p in cur_cvd.split(",") if p.strip()]
@@ -555,11 +582,7 @@ class LanguageModel(object):
         verbose: bool = False,
         return_log_probs: bool = False,
     ) -> Union[List[str], Tuple[List[str], torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]]]]:
-        """Generate text completions using vLLM only (no HF fallback)."""
-        if not self.use_vllm or (self.vllm_worker is None and self.vllm_engine is None):
-            raise RuntimeError(
-                "vLLM engine is not available. Enable use_vllm or build a merged engine (FacT)."
-            )
+        """Generate text completions (vLLM preferred, HF fallback)."""
         conversations = []
         for prompt in prompts:
             conversations.append(self.tokenizer.apply_chat_template(
@@ -576,6 +599,7 @@ class LanguageModel(object):
         if return_log_probs:
             sampling_kwargs["logprobs"] = 1
 
+        use_vllm_path = self.use_vllm and (self.vllm_worker is not None or self.vllm_engine is not None)
         worker_payload: Optional[List[Dict[str, Any]]] = None
         worker_use_lora = (
             self.vllm_worker is not None
@@ -583,14 +607,14 @@ class LanguageModel(object):
             and isinstance(self.vllm_lora_adapter_path, str)
         )
 
-        if self.vllm_worker is not None:
+        if use_vllm_path and self.vllm_worker is not None:
             worker_payload = self.vllm_worker.generate(
                 conversations=conversations,
                 sampling=sampling_kwargs,
                 use_lora=worker_use_lora,
             )
             completions = [item.get("text", "") for item in worker_payload]
-        else:
+        elif use_vllm_path:
             lora_kwargs: Dict[str, Any] = {}
             if (
                 VLLMLoRARequest is not None
@@ -629,6 +653,77 @@ class LanguageModel(object):
                     }
                 )
             completions = [entry["text"] for entry in worker_payload]
+        else:
+            # HF fallback: generate with Hugging Face model
+            batch = self.tokenizer(
+                conversations,
+                add_special_tokens=False,
+                return_tensors="pt",
+                padding=True,
+            )
+            input_ids = batch["input_ids"].to(self.device)
+            attn_mask = batch.get("attention_mask", torch.ones_like(input_ids)).to(self.device)
+            prev_training = self.model.training
+            prev_use_cache = getattr(self.model.config, "use_cache", True)
+            had_gc = getattr(self.model, "is_gradient_checkpointing", False)
+            self.model.eval()
+            try:
+                self.model.gradient_checkpointing_disable()
+            except Exception:
+                pass
+            # Honor existing config.use_cache set by callers; do not force True here.
+            with torch.no_grad():
+                # Prefer BF16 autocast to reduce overflow risk; fallback to FP16 or disable.
+                if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                    try:
+                        amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    except Exception:
+                        try:
+                            amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
+                        except Exception:
+                            amp_ctx = nullcontext()
+                else:
+                    amp_ctx = nullcontext()
+                with amp_ctx:
+                    gen_out = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attn_mask,
+                        max_new_tokens=int(limitation),
+                        do_sample=(float(temperature) > 0.0),
+                        temperature=float(temperature) if float(temperature) > 0.0 else 1.0,
+                        eos_token_id=self.eos_token_id,
+                        pad_token_id=self.pad_token_id,
+                        use_cache=getattr(self.model.config, "use_cache", True),
+                        return_dict_in_generate=False,
+                        output_scores=False,
+                    )
+            sequences = gen_out.sequences if hasattr(gen_out, "sequences") else gen_out
+            completions = []
+            gen_ids_list: List[List[int]] = []
+            for i in range(sequences.size(0)):
+                pref_len = int(attn_mask[i].sum().item())
+                gen_ids = sequences[i][pref_len:].tolist()
+                gen_ids_list.append(gen_ids)
+                try:
+                    text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                except Exception:
+                    text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                completions.append(text)
+            try:
+                self.model.config.use_cache = prev_use_cache
+            except Exception:
+                pass
+            if had_gc:
+                try:
+                    self.model.gradient_checkpointing_enable()
+                except Exception:
+                    pass
+            if prev_training:
+                self.model.train()
+            worker_payload = [
+                {"text": txt, "token_ids": ids, "logprobs": None}
+                for txt, ids in zip(completions, gen_ids_list)
+            ]
         if worker_payload is None:
             worker_payload = []
         # Prefer token ids from vLLM if available to avoid retokenization mismatch
@@ -712,7 +807,7 @@ class LanguageModel(object):
                         float("nan") if lp is None else float(lp) for lp in log_probs  # type: ignore[arg-type]
                     ]
                     vllm_log_probs_list.append(
-                        torch.tensor(tensor_vals, dtype=torch.float32, device=self.device)
+                        torch.tensor(tensor_vals, dtype=torch.float32, device="cpu")
                     )
         if not prefix_ids_list or not gen_ids_list:
             max_len = 0
@@ -740,11 +835,12 @@ class LanguageModel(object):
             mask = [False] * len(p_ids) + [True] * len(g_ids) + [False] * max(pad_len, 0)
             masks_list.append(mask)
         if len(indices_list) == 0:
-            indices = torch.empty((0, 0), dtype=torch.long, device=self.device)
-            masks = torch.empty((0, 0), dtype=torch.bool, device=self.device)
+            indices = torch.empty((0, 0), dtype=torch.long, device="cpu")
+            masks = torch.empty((0, 0), dtype=torch.bool, device="cpu")
         else:
-            indices = torch.tensor(indices_list, dtype=torch.long, device=self.device)
-            masks = torch.tensor(masks_list, dtype=torch.bool, device=self.device)
+            # Build tensors on CPU to reduce peak GPU memory during rollout
+            indices = torch.tensor(indices_list, dtype=torch.long, device="cpu")
+            masks = torch.tensor(masks_list, dtype=torch.bool, device="cpu")
 
         if verbose:
             return completions, indices, masks, vllm_log_probs_list
@@ -1010,11 +1106,11 @@ class LanguageModel(object):
                 W_add = (V @ T @ U) * scaling
                 W_eff = W_orig + W_add
                 weight_key = f"{mname}.weight"
-                weights.append((weight_key, W_eff))
+                weights.append((weight_key, W_eff.detach().to("cpu").contiguous()))
                 visited.add(weight_key)
                 if original.bias is not None:
                     bias_key = f"{mname}.bias"
-                    weights.append((bias_key, original.bias.detach()))
+                    weights.append((bias_key, original.bias.detach().to("cpu").contiguous()))
                     visited.add(bias_key)
 
             # 2) Emit the rest tensors (skip FacT internals and original_layer.*)
@@ -1023,15 +1119,14 @@ class LanguageModel(object):
                     continue
                 if k in visited:
                     continue
-                weights.append((k, v.detach()))
+                weights.append((k, v.detach().to("cpu").contiguous()))
 
             try:
                 # Send to worker for in-place load
                 # Large lists: chunk to avoid IPC payload limits
-                CHUNK = 2048
+                CHUNK = 1024
                 for i in range(0, len(weights), CHUNK):
                     chunk = weights[i:i+CHUNK]
-                    # worker will cpu().contiguous() itself; we keep device tensors here
                     self.vllm_worker._request({"op": "update_weights", "weights": chunk})
                 # Reset prefix cache if any lingering state
                 try:
@@ -1071,15 +1166,52 @@ class LanguageModel(object):
         sd = self.model.state_dict()
         visited: set[str] = set()
 
+        # Inspect internal model's expected keys to build a mapper
+        try:
+            sd_keys = list(getattr(internal_model, "state_dict")().keys())  # type: ignore[attr-defined]
+        except Exception:
+            sd_keys = []
+
+        def _has_prefix(prefix: str) -> bool:
+            return any(k.startswith(prefix) for k in sd_keys)
+
+        layers_top = _has_prefix("layers.")
+        layers_under_model = (not layers_top) and _has_prefix("model.layers.")
+        embed_top = _has_prefix("embed_tokens.")
+        embed_under_model = (not embed_top) and _has_prefix("model.embed_tokens.")
+        norm_top = _has_prefix("norm.")
+        norm_under_model = (not norm_top) and _has_prefix("model.norm.")
+
+        def _map_key(k: str) -> str:
+            # Normalize some common HF prefixes
+            if k.startswith("transformer."):
+                k = "model." + k[len("transformer."):]
+            if layers_top and k.startswith("model.layers."):
+                k = k[len("model."):]
+            elif layers_under_model and k.startswith("layers."):
+                k = "model." + k
+            if embed_top and k.startswith("model.embed_tokens."):
+                k = k[len("model."):]
+            elif embed_under_model and k.startswith("embed_tokens."):
+                k = "model." + k
+            if norm_top and k.startswith("model.norm."):
+                k = k[len("model."):]
+            elif norm_under_model and k.startswith("norm."):
+                k = "model." + k
+            return k
+
+        sd_set = set(sd_keys)
+
+        # If internal expects fused QKV, fuse when possible
+        expect_fused_qkv = any(key.endswith("self_attn.qkv_proj.weight") for key in sd_keys)
+
         def gen():
             # 1) Emit merged weights for FacT-wrapped Linear modules
             for mname, mod in fact_wrapped.items():
-                # Compute effective dense weight on the same device/dtype, then move to CPU for stability
                 original = mod.original_layer
                 W_orig = original.weight.detach()
                 device = W_orig.device
                 dtype = W_orig.dtype
-                # Shapes: U[r,in], T[r,r], V[out,r]
                 U = mod.fact_u.weight.detach().to(device=device, dtype=dtype)
                 T = mod.fact_t.weight.detach().to(device=device, dtype=dtype)
                 V = mod.fact_v.weight.detach().to(device=device, dtype=dtype)
@@ -1087,22 +1219,80 @@ class LanguageModel(object):
                 W_add = (V @ T @ U) * scaling
                 W_eff = W_orig + W_add
 
-                weight_key = f"{mname}.weight"
+                weight_key = _map_key(f"{mname}.weight")
                 yield weight_key, W_eff.detach().cpu().contiguous()
                 visited.add(weight_key)
 
                 if original.bias is not None:
-                    bias_key = f"{mname}.bias"
+                    bias_key = _map_key(f"{mname}.bias")
                     yield bias_key, original.bias.detach().cpu().contiguous()
                     visited.add(bias_key)
 
-            # 2) Emit the rest of tensors (skip FacT internals and original_layer.* placeholders)
+            # 2) Emit the rest tensors with mapping and optional QKV fusion
+            # For fusion, buffer q/k/v per layer prefix
+            fuse_buckets: Dict[str, Dict[str, torch.Tensor]] = {}
+
+            def _flush_fused(prefix: str):
+                bucket = fuse_buckets.get(prefix)
+                if not bucket or not all(x in bucket for x in ("q", "k", "v")):
+                    return False
+                try:
+                    qkv = torch.cat([bucket["q"], bucket["k"], bucket["v"]], dim=0)
+                except Exception:
+                    return False
+                fused_key = f"{prefix}.self_attn.qkv_proj.weight"
+                mapped = _map_key(fused_key)
+                if mapped in sd_set:
+                    yield mapped, qkv.detach().cpu().contiguous()
+                    return True
+                return False
+
             for k, v in sd.items():
                 if ".fact_" in k or ".original_layer." in k:
                     continue
-                if k in visited:
+                mapped = _map_key(k)
+                if mapped in visited:
                     continue
-                yield k, v.detach().cpu().contiguous()
+                # QKV fusion handling
+                if expect_fused_qkv and (
+                    mapped.endswith(".self_attn.q_proj.weight") or
+                    mapped.endswith(".self_attn.k_proj.weight") or
+                    mapped.endswith(".self_attn.v_proj.weight")
+                ):
+                    try:
+                        base, tail = mapped.split(".self_attn.", 1)
+                        if tail.startswith("q_proj.weight"):
+                            fuse_buckets.setdefault(base, {})["q"] = v.detach()
+                        elif tail.startswith("k_proj.weight"):
+                            fuse_buckets.setdefault(base, {})["k"] = v.detach()
+                        elif tail.startswith("v_proj.weight"):
+                            fuse_buckets.setdefault(base, {})["v"] = v.detach()
+                        # Try to flush when complete
+                        res = False
+                        for out in _flush_fused(base) or []:
+                            yield out  # type: ignore[misc]
+                            res = True
+                        if res:
+                            visited.add(f"{base}.self_attn.qkv_proj.weight")
+                        continue
+                    except Exception:
+                        pass
+                # Default: emit mapped key if present in internal state
+                if sd_set and mapped not in sd_set:
+                    # Skip keys that internal model doesn't have
+                    continue
+                tensor = v.detach().cpu().contiguous()
+                yield mapped, tensor
+
+            # Flush any remaining incomplete fusion buckets by emitting separate keys
+            if expect_fused_qkv:
+                for base, bucket in fuse_buckets.items():
+                    for tag in ("q", "k", "v"):
+                        if tag in bucket:
+                            tail = {"q": "q_proj.weight", "k": "k_proj.weight", "v": "v_proj.weight"}[tag]
+                            mapped = _map_key(f"{base}.self_attn.{tail}")
+                            if not sd_set or mapped in sd_set:
+                                yield mapped, bucket[tag].detach().cpu().contiguous()
 
         internal_model.load_weights(gen())
 
