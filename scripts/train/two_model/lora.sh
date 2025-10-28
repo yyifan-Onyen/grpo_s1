@@ -4,7 +4,6 @@
 
 echo "=== GRPO Two Models LoRA (Collaborative Training) ==="
 export VLLM_USE_V1=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PYTHON=${PYTHON:-python3}
 
 export TOKENIZERS_PARALLELISM=true

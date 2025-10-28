@@ -137,6 +137,8 @@ def _rollout_model_batch(
 ):
     per_question_eps: List[List[dict]] = [[] for _ in range(len(questions))]
     _decode_t0 = time.perf_counter()
+    _gen_time_total = 0.0
+    _lp_time_total = 0.0
 
     if len(questions) == 0:
         return per_question_eps
@@ -176,6 +178,7 @@ def _rollout_model_batch(
         end = min(start + decode_chunk_size, len(prompts))
         chunk_prompts = prompts[start:end]
         chunk_qrefs = q_refs[start:end]
+        t_gen0 = time.perf_counter()
         try:
             completions, indices, masks, vllm_lps = _gen_model.generate(
                 prompts=chunk_prompts,
@@ -186,9 +189,10 @@ def _rollout_model_batch(
                 return_log_probs=False,
             )
         finally:
-            pass
+            _gen_time_total += (time.perf_counter() - t_gen0)
         # 批量计算旧策略对数概率，按小批分块控制显存
         old_lp_list: list[list[float]] = []
+        t_lp0 = time.perf_counter()
         try:
             B = indices.size(0)
             if B > 0:
@@ -214,7 +218,7 @@ def _rollout_model_batch(
                 except Exception:
                     p_dtype = torch.bfloat16
 
-                lp_bs = min(B, 16)
+                lp_bs = min(B, 8)
                 with torch.inference_mode():
                     amp_ctx = (
                         torch.autocast(device_type="cuda", dtype=p_dtype)
@@ -242,6 +246,7 @@ def _rollout_model_batch(
             print(f"[TRAIN] old_log_probs (multi-model, batched) failed: {_e}")
             old_lp_list = [[] for _ in range(len(completions))]
         finally:
+            _lp_time_total += (time.perf_counter() - t_lp0)
             try:
                 model.model.config.use_cache = prev_use_cache
             except Exception:
@@ -281,7 +286,7 @@ def _rollout_model_batch(
     _decode_elapsed = time.perf_counter() - _decode_t0
     try:
         print(
-            f"[timing][rollout] {name} ({device}) decode={_decode_elapsed:.2f}s, prompts={len(prompts)}, chunk={decode_chunk_size}, engine={_engine_label}",
+            f"[timing][rollout] {name} ({device}) gen={_gen_time_total:.2f}s, lp={_lp_time_total:.2f}s, total={_decode_elapsed:.2f}s, prompts={len(prompts)}, chunk={decode_chunk_size}, engine={_engine_label}",
             flush=True,
         )
     except Exception:
@@ -654,11 +659,14 @@ def main():
                     _peer_dtype = _first_p.dtype
                 except Exception:
                     _peer_dtype = dtype
+                name_i = model_names[i]
+                _is_smol_peer = "smol" in str(name_i).lower()
+                _peer_attn_impl = "flash" if _is_smol_peer else getattr(models[i], "attn_impl", "sdpa")
                 peer = LanguageModel(
                     model_path=str(pretrained_model_paths[i]),
                     target_device=peer_device,
                     torch_dtype=_peer_dtype,
-                    attn_impl=getattr(models[i], "attn_impl", "sdpa"),
+                    attn_impl=_peer_attn_impl,
                     fact_config=fact_config,
                     lora_config=lora_config,
                     gradient_checkpointing=False,
@@ -666,6 +674,13 @@ def main():
                 )
                 # Inference-only, save memory
                 peer.model.eval()
+                if _is_smol_peer:
+                    try:
+                        # Prefer FP16 for rollout peer to speed up decode without affecting training model
+                        with torch.inference_mode():
+                            peer.model.half()
+                    except Exception:
+                        pass
                 try:
                     peer.model.config.use_cache = True
                 except Exception:
@@ -1415,12 +1430,15 @@ def main():
                     # Decode in chunks to avoid OOM (cap per-call prompts)
                     decode_chunk_size = min(len(prompts), 128 if _is_smol else 256)
                     _single_decode_t0 = time.perf_counter()
+                    _single_gen_total = 0.0
+                    _single_lp_total = 0.0
                     model_rewards = []
                     processed = 0
                     for start_idx in range(0, len(prompts), decode_chunk_size):
                         end_idx = min(start_idx + decode_chunk_size, len(prompts))
                         chunk_prompts = prompts[start_idx:end_idx]
                         chunk_refs = sample_refs[start_idx:end_idx]
+                        _tgen0 = time.perf_counter()
                         completions, indices, masks, vllm_lps = model.generate(
                             prompts=chunk_prompts,
                             limitation=MAX_GEN_LEN,
@@ -1429,8 +1447,10 @@ def main():
                             # OpenRLHF-style: vLLM 仅用于生成，旧策略对数概率由 HF/Actor 计算
                             return_log_probs=False,
                         )
+                        _single_gen_total += (time.perf_counter() - _tgen0)
                         # 批量计算旧策略对数概率（优先使用 vLLM 提供的，否则批量前向）
                         old_lp_batch: list[list[float]] = []
+                        _tlp0 = time.perf_counter()
                         try:
                             if isinstance(vllm_lps, list) and len(vllm_lps) == len(completions) and all(x is not None for x in vllm_lps):
                                 for x in vllm_lps:
@@ -1463,7 +1483,7 @@ def main():
                                     except Exception:
                                         p_dtype = torch.bfloat16
 
-                                    lp_bs = min(B, 16)
+                                    lp_bs = min(B, 8)
                                     with torch.inference_mode():
                                         amp_ctx = (
                                             torch.autocast(device_type="cuda", dtype=p_dtype)
@@ -1491,6 +1511,7 @@ def main():
                             print(f"[TRAIN] old_log_probs (single-model, batched) failed: {_e}")
                             old_lp_batch = [[] for _ in range(len(completions))]
                         finally:
+                            _single_lp_total += (time.perf_counter() - _tlp0)
                             try:
                                 model.model.config.use_cache = prev_use_cache
                             except Exception:
@@ -1532,7 +1553,7 @@ def main():
                     try:
                         _single_elapsed = time.perf_counter() - _single_decode_t0
                         print(
-                            f"[timing][rollout] {name} ({device}) decode={_single_elapsed:.2f}s, prompts={len(prompts)}, chunk={decode_chunk_size}, engine={engine_label}",
+                            f"[timing][rollout] {name} ({device}) gen={_single_gen_total:.2f}s, lp={_single_lp_total:.2f}s, total={_single_elapsed:.2f}s, prompts={len(prompts)}, chunk={decode_chunk_size}, engine={engine_label}",
                             flush=True,
                         )
                     except Exception:
@@ -1869,12 +1890,6 @@ def main():
             
             torch.cuda.empty_cache()
             gc.collect()
-            
-            # Optionally add cleanup or memory logging keyed by batch_step if needed
-
-            # 检查点改为在策略更新步上保存，由更新块统一处理
-
-    # Save final checkpoint(s) at the end of training if requested
     if args.save_final:
         for model_idx, (model, name) in enumerate(zip(models, model_names)):
             final_ckpt_path = Path(args.ckpt_dir) / f"{name}_final_step_{batch_step}"

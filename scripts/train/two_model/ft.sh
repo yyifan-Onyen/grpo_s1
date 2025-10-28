@@ -4,12 +4,6 @@
 
 echo "=== GRPO Two Models FT (Collaborative Training) ==="
 export VLLM_USE_V1=0
-# export CUDA_LAUNCH_BLOCKING=1
-# Disable expandable_segments to avoid allocator illegal access in multi-threaded rollout
-# Use expandable segments and tune allocator to reduce fragmentation while avoiding thread-time empty_cache calls
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8
-export TORCH_ALLOW_TF32=1
-export NVIDIA_TF32_OVERRIDE=1
 PYTHON=${PYTHON:-python3}
 export TOKENIZERS_PARALLELISM=true
 
@@ -46,7 +40,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 ${PYTHON} train_new.py \
   --loss-aggregation token-mean \
   --advantage-clip 0.6 \
   --use-vllm --vllm-gpu-mem 0.6 --vllm-max-model-len 32768 --vllm-gpus 2 -1 \
-  --rollout-batch-size 64 \
+  --rollout-batch-size 32 \
   --run-name "GRPO_TwoModels_FT_$(date +%Y%m%d_%H%M%S)" \
   > logs/two_model_ft.log 2>&1 &
 
